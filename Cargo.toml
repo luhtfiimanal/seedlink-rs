@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = [
+    "seedlink-protocol",
+    "seedlink-client",
+    "seedlink-server",
+]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/luhtfiimanal/seedlink-rs"
+exclude = ["pyscripts/", "CLAUDE.md", "PROMPT.md"]
+
+[workspace.dependencies]
+seedlink-protocol = { path = "seedlink-protocol" }
+miniseed-rs = "0.2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

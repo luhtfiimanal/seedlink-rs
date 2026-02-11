@@ -1,0 +1,16 @@
+[package]
+name = "seedlink-client"
+version = "0.1.0"
+description = "Async SeedLink client for real-time seismic data streaming"
+readme = "../README.md"
+keywords = ["seismic", "seedlink", "client", "streaming", "fdsn"]
+categories = ["network-programming", "science"]
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+seedlink-protocol.workspace = true
+miniseed-rs.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

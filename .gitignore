@@ -1,0 +1,25 @@
+# Rust
+/target
+
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+
+# Environment
+.env
+.env.*
+
+# Test vectors (regenerate locally)
+pyscripts/test_vectors/
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
