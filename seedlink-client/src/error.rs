@@ -9,7 +9,7 @@ pub enum ClientError {
 
     /// SeedLink protocol parsing error (invalid frame, bad command format, etc.).
     #[error("protocol error: {0}")]
-    Protocol(#[from] seedlink_protocol::SeedlinkError),
+    Protocol(#[from] seedlink_rs_protocol::SeedlinkError),
 
     /// Operation exceeded the configured timeout duration.
     #[error("timeout after {0:?}")]

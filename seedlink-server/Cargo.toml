@@ -1,5 +1,5 @@
 [package]
-name = "seedlink-server"
+name = "seedlink-rs-server"
 version = "0.1.0"
 description = "Async SeedLink server for real-time seismic data distribution"
 readme = "../README.md"
@@ -10,7 +10,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-seedlink-protocol.workspace = true
+seedlink-rs-protocol.workspace = true
 miniseed-rs.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

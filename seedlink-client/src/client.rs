@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use seedlink_protocol::{Command, InfoLevel, ProtocolVersion, Response, SequenceNumber};
+use seedlink_rs_protocol::{Command, InfoLevel, ProtocolVersion, Response, SequenceNumber};
 
 use crate::connection::Connection;
 use crate::error::{ClientError, Result};
@@ -15,8 +15,8 @@ use crate::state::{ClientConfig, ClientState, OwnedFrame, ServerInfo, StationKey
 /// # Example
 ///
 /// ```no_run
-/// # async fn example() -> seedlink_client::Result<()> {
-/// use seedlink_client::SeedLinkClient;
+/// # async fn example() -> seedlink_rs_client::Result<()> {
+/// use seedlink_rs_client::SeedLinkClient;
 ///
 /// let mut client = SeedLinkClient::connect("rtserve.iris.washington.edu:18000").await?;
 /// client.station("ANMO", "IU").await?;
@@ -339,14 +339,14 @@ impl SeedLinkClient {
 
             match &peek {
                 b"SL" => {
-                    let mut buf = [0u8; seedlink_protocol::frame::v3::FRAME_LEN];
+                    let mut buf = [0u8; seedlink_rs_protocol::frame::v3::FRAME_LEN];
                     buf[0..2].copy_from_slice(&peek);
                     self.connection.read_exact(&mut buf[2..]).await?;
-                    let raw = seedlink_protocol::frame::v3::parse(&buf)?;
+                    let raw = seedlink_rs_protocol::frame::v3::parse(&buf)?;
                     frames.push(OwnedFrame::from(raw));
                 }
                 b"SE" => {
-                    let mut header = [0u8; seedlink_protocol::frame::v4::MIN_HEADER_LEN];
+                    let mut header = [0u8; seedlink_rs_protocol::frame::v4::MIN_HEADER_LEN];
                     header[0..2].copy_from_slice(&peek);
                     self.connection.read_exact(&mut header[2..]).await?;
                     let station_id_len = header[16] as usize;
@@ -354,14 +354,17 @@ impl SeedLinkClient {
                         u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
                     let remaining = station_id_len + payload_len;
                     let mut full = Vec::with_capacity(
-                        seedlink_protocol::frame::v4::MIN_HEADER_LEN + remaining,
+                        seedlink_rs_protocol::frame::v4::MIN_HEADER_LEN + remaining,
                     );
                     full.extend_from_slice(&header);
-                    full.resize(seedlink_protocol::frame::v4::MIN_HEADER_LEN + remaining, 0);
+                    full.resize(
+                        seedlink_rs_protocol::frame::v4::MIN_HEADER_LEN + remaining,
+                        0,
+                    );
                     self.connection
-                        .read_exact(&mut full[seedlink_protocol::frame::v4::MIN_HEADER_LEN..])
+                        .read_exact(&mut full[seedlink_rs_protocol::frame::v4::MIN_HEADER_LEN..])
                         .await?;
-                    let (raw, _) = seedlink_protocol::frame::v4::parse(&full)?;
+                    let (raw, _) = seedlink_rs_protocol::frame::v4::parse(&full)?;
                     frames.push(OwnedFrame::from(raw));
                 }
                 _ => {
@@ -490,7 +493,7 @@ impl SeedLinkClient {
 mod tests {
     use super::*;
     use crate::mock::{MockConfig, MockServer};
-    use seedlink_protocol::frame::{PayloadFormat, PayloadSubformat, v3, v4};
+    use seedlink_rs_protocol::frame::{PayloadFormat, PayloadSubformat, v3, v4};
 
     fn make_v3_frame(seq: u64, station: &str, network: &str) -> Vec<u8> {
         let mut payload = [0u8; v3::PAYLOAD_LEN];

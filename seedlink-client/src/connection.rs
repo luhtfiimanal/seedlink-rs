@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use seedlink_protocol::frame::{v3, v4};
-use seedlink_protocol::{Command, ProtocolVersion};
+use seedlink_rs_protocol::frame::{v3, v4};
+use seedlink_rs_protocol::{Command, ProtocolVersion};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -101,8 +101,8 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seedlink_protocol::SequenceNumber;
-    use seedlink_protocol::frame::{PayloadFormat, PayloadSubformat};
+    use seedlink_rs_protocol::SequenceNumber;
+    use seedlink_rs_protocol::frame::{PayloadFormat, PayloadSubformat};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 

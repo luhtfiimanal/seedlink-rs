@@ -6,8 +6,8 @@
 
 use std::time::Duration;
 
-use seedlink_client::{ClientConfig, SeedLinkClient};
-use seedlink_protocol::{InfoLevel, ProtocolVersion};
+use seedlink_rs_client::{ClientConfig, SeedLinkClient};
+use seedlink_rs_protocol::{InfoLevel, ProtocolVersion};
 
 fn v3_server() -> Option<String> {
     std::env::var("SEEDLINK_TEST_SERVER").ok()
@@ -98,7 +98,10 @@ async fn v3_bye() {
         .unwrap();
 
     client.bye().await.unwrap();
-    assert_eq!(client.state(), seedlink_client::ClientState::Disconnected);
+    assert_eq!(
+        client.state(),
+        seedlink_rs_client::ClientState::Disconnected
+    );
 }
 
 #[tokio::test]

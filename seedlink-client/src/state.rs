@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use seedlink_protocol::{PayloadFormat, PayloadSubformat, RawFrame, SequenceNumber};
+use seedlink_rs_protocol::{PayloadFormat, PayloadSubformat, RawFrame, SequenceNumber};
 
 /// Client connection state machine.
 ///

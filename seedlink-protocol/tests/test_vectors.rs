@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use seedlink_protocol::frame::{v3, v4};
-use seedlink_protocol::{Command, ProtocolVersion, Response, SequenceNumber};
+use seedlink_rs_protocol::frame::{v3, v4};
+use seedlink_rs_protocol::{Command, ProtocolVersion, Response, SequenceNumber};
 
 fn vectors_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -265,7 +265,7 @@ fn test_v4_frame_vectors() {
         assert_eq!(raw.payload(), &expected_payload[..]);
 
         match &raw {
-            seedlink_protocol::RawFrame::V4 {
+            seedlink_rs_protocol::RawFrame::V4 {
                 format,
                 subformat,
                 station_id,

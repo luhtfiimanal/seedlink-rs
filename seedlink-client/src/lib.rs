@@ -6,8 +6,8 @@
 //! # Example
 //!
 //! ```no_run
-//! # async fn example() -> seedlink_client::Result<()> {
-//! use seedlink_client::SeedLinkClient;
+//! # async fn example() -> seedlink_rs_client::Result<()> {
+//! use seedlink_rs_client::SeedLinkClient;
 //!
 //! let mut client = SeedLinkClient::connect("rtserve.iris.washington.edu:18000").await?;
 //! client.station("ANMO", "IU").await?;

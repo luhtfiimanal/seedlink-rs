@@ -1,5 +1,5 @@
 [package]
-name = "seedlink-protocol"
+name = "seedlink-rs-protocol"
 version = "0.1.0"
 description = "SeedLink protocol types, commands, and frame parsing"
 readme = "../README.md"

@@ -1,5 +1,5 @@
 [package]
-name = "seedlink-client"
+name = "seedlink-rs-client"
 version = "0.1.0"
 description = "Async SeedLink client for real-time seismic data streaming"
 readme = "../README.md"
@@ -10,7 +10,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-seedlink-protocol.workspace = true
+seedlink-rs-protocol.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

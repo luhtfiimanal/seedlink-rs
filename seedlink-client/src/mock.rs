@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use seedlink_protocol::ProtocolVersion;
+use seedlink_rs_protocol::ProtocolVersion;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 

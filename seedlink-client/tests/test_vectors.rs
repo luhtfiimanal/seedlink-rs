@@ -7,8 +7,8 @@
 
 use std::path::Path;
 
-use seedlink_protocol::frame::{v3, v4};
-use seedlink_protocol::{Response, SequenceNumber};
+use seedlink_rs_protocol::frame::{v3, v4};
+use seedlink_rs_protocol::{Response, SequenceNumber};
 use serde::Deserialize;
 
 const VECTORS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../pyscripts/test_vectors");
@@ -137,7 +137,7 @@ fn verify_v4_conversation() {
             "frame {i} payload length mismatch"
         );
         match &raw {
-            seedlink_protocol::RawFrame::V4 { station_id, .. } => {
+            seedlink_rs_protocol::RawFrame::V4 { station_id, .. } => {
                 assert_eq!(*station_id, fv.station_id, "frame {i} station_id mismatch");
             }
             _ => panic!("expected V4 frame at index {i}"),
