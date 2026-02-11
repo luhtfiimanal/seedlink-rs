@@ -11,6 +11,11 @@ repository.workspace = true
 
 [dependencies]
 seedlink-protocol.workspace = true
-miniseed-rs.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+hex = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["test-util"] }
