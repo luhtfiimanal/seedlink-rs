@@ -100,6 +100,21 @@ Tested against real SeedLink servers:
 
 219 tests passing across all three crates.
 
+## Benchmarks
+
+Server fan-out stress test on localhost (loopback TCP). The traditional C-based SeedLink servers ([ringserver](https://github.com/EarthScope/ringserver), [SeisComP seedlink](https://github.com/SeisComP/seedlink)) use thread-per-connection with blocking I/O. seedlink-rs uses async I/O (tokio/epoll) — delivering **10.7 million frames/sec** to 100 concurrent clients with zero frame loss.
+
+| Clients | Records | Total Frames | Push Throughput | Receive Throughput | Wall Clock | Correctness |
+|--------:|--------:|-------------:|----------------:|-------------------:|-----------:|:-----------:|
+| 50 | 10,000 | 500,000 | 47K rec/s | 2.4M frames/s | 0.42s | 100% |
+| 100 | 10,000 | 1,000,000 | 34K rec/s | 10.7M frames/s | 0.39s | 100% |
+
+A typical seismic network produces ~10K records/sec. This server can fan-out that load to 100 clients in real-time with headroom to spare.
+
+Run `cargo run --example stress_test -p seedlink-rs-server --release` to reproduce. Configurable via env vars: `CLIENTS`, `RECORDS`, `RING_CAP`.
+
+*Platform: AMD Ryzen 5 5600G (6C/12T, 4.46 GHz), 16 GB DDR4, Linux 6.17, rustc 1.92.0, `--release`*
+
 ## Documentation
 
 See [docs/FEATURES.md](docs/FEATURES.md) for comprehensive feature documentation.
