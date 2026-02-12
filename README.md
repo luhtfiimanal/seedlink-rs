@@ -102,14 +102,26 @@ Tested against real SeedLink servers:
 
 ## Benchmarks
 
-Server fan-out stress test on localhost (loopback TCP). The traditional C-based SeedLink servers ([ringserver](https://github.com/EarthScope/ringserver), [SeisComP seedlink](https://github.com/SeisComP/seedlink)) use thread-per-connection with blocking I/O. seedlink-rs uses async I/O (tokio/epoll) — delivering **10.7 million frames/sec** to 100 concurrent clients with zero frame loss.
+Server fan-out stress test on localhost (loopback TCP). The traditional C-based SeedLink servers ([ringserver](https://github.com/EarthScope/ringserver), [SeisComP seedlink](https://github.com/SeisComP/seedlink)) use thread-per-connection with blocking I/O. seedlink-rs uses async I/O (tokio/epoll) — delivering **10.7 million frames/sec** aggregate to 100 concurrent clients with zero frame loss.
 
-| Clients | Records | Total Frames | Push Throughput | Receive Throughput | Wall Clock | Correctness |
-|--------:|--------:|-------------:|----------------:|-------------------:|-----------:|:-----------:|
-| 50 | 10,000 | 500,000 | 47K rec/s | 2.4M frames/s | 0.42s | 100% |
-| 100 | 10,000 | 1,000,000 | 34K rec/s | 10.7M frames/s | 0.39s | 100% |
+```
+                        Ingestion                    Fan-out delivery
+                        ─────────►                   ─────────────────►
+Data source ──► [ Server ring buffer ] ──► Client 1   (10,000 frames)
+                    34K rec/s              Client 2   (10,000 frames)
+                                           ...
+                                           Client 100 (10,000 frames)
+                                           ─────────────────────────────
+                                           Total: 1,000,000 frames
+                                           in 0.094s = 10.7M frames/s
+```
 
-A typical seismic network produces ~10K records/sec. This server can fan-out that load to 100 clients in real-time with headroom to spare.
+Each record is one 512-byte miniSEED packet. One record pushed = one frame delivered per subscribed client.
+
+| Scenario | Clients | Records Pushed | Ingestion Rate | Per-Client Delivery | Aggregate Output | Correctness |
+|----------|--------:|---------------:|---------------:|--------------------:|-----------------:|:-----------:|
+| Default  | 50 | 10,000 | 47K rec/s | 48K frames/s | 2.4M frames/s | 100% |
+| High     | 100 | 10,000 | 34K rec/s | 107K frames/s | 10.7M frames/s | 100% |
 
 Run `cargo run --example stress_test -p seedlink-rs-server --release` to reproduce. Configurable via env vars: `CLIENTS`, `RECORDS`, `RING_CAP`.
 
