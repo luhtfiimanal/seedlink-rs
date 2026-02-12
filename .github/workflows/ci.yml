@@ -24,14 +24,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish -p seedlink-rs-protocol
+      - run: cargo publish -p seedlink-rs-protocol || true  # skip if already published
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       - run: sleep 30  # wait for crates.io index to propagate
-      - run: cargo publish -p seedlink-rs-client
+      - run: cargo publish -p seedlink-rs-client || true
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       # - run: sleep 30
-      # - run: cargo publish -p seedlink-rs-server
+      # - run: cargo publish -p seedlink-rs-server || true
       #   env:
       #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
