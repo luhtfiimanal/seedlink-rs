@@ -21,11 +21,13 @@
 //! # }
 //! ```
 
+pub(crate) mod connections;
 pub mod error;
 pub(crate) mod handler;
 pub(crate) mod info;
 pub(crate) mod select;
 pub mod store;
+pub(crate) mod time;
 
 pub use error::{Result, ServerError};
 pub use store::DataStore;
@@ -33,13 +35,14 @@ pub use store::DataStore;
 use std::net::SocketAddr;
 use std::time::SystemTime;
 
+use connections::ConnectionRegistry;
 use handler::{ClientHandler, HandlerConfig};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
 /// Format a SystemTime as "YYYY/MM/DD HH:MM:SS" without chrono.
-fn format_timestamp(time: SystemTime) -> String {
+pub(crate) fn format_timestamp(time: SystemTime) -> String {
     let dur = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
@@ -146,6 +149,7 @@ pub struct SeedLinkServer {
     started: String,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    connections: ConnectionRegistry,
 }
 
 impl SeedLinkServer {
@@ -160,6 +164,7 @@ impl SeedLinkServer {
         let store = DataStore::new(config.ring_capacity);
         let started = format_timestamp(SystemTime::now());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connections = ConnectionRegistry::new();
         info!(addr, "server bound");
         Ok(Self {
             listener,
@@ -168,6 +173,7 @@ impl SeedLinkServer {
             started,
             shutdown_tx,
             shutdown_rx,
+            connections,
         })
     }
 
@@ -212,6 +218,7 @@ impl SeedLinkServer {
             info!(%addr, "accepted connection");
             stream.set_nodelay(true).ok();
 
+            let conn_id = self.connections.register(addr);
             let (read_half, write_half) = stream.into_split();
             let store = self.store.clone();
             let handler_config = HandlerConfig {
@@ -221,10 +228,18 @@ impl SeedLinkServer {
                 started: self.started.clone(),
             };
             let shutdown_rx = self.shutdown_rx.clone();
+            let connections = self.connections.clone();
 
             tokio::spawn(async move {
-                let handler =
-                    ClientHandler::new(read_half, write_half, store, handler_config, shutdown_rx);
+                let handler = ClientHandler::new(
+                    read_half,
+                    write_half,
+                    store,
+                    handler_config,
+                    shutdown_rx,
+                    conn_id,
+                    connections,
+                );
                 handler.run().await;
             });
         }
@@ -819,7 +834,7 @@ mod tests {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
 
-        write_half.write_all(b"INFO CONNECTIONS\r\n").await.unwrap();
+        write_half.write_all(b"INFO GAPS\r\n").await.unwrap();
         write_half.flush().await.unwrap();
 
         let mut line = String::new();
@@ -964,5 +979,347 @@ mod tests {
         // EOF
         let f3 = client.next_frame().await.unwrap();
         assert!(f3.is_none(), "expected EOF after FETCH");
+    }
+
+    // ---- Helper: set_btime ----
+
+    /// Write BTime fields into a miniSEED payload at bytes 20..30 (big-endian).
+    fn set_btime(payload: &mut [u8], year: u16, doy: u16, hour: u8, min: u8, sec: u8) {
+        let year_be = year.to_be_bytes();
+        payload[20] = year_be[0];
+        payload[21] = year_be[1];
+        let doy_be = doy.to_be_bytes();
+        payload[22] = doy_be[0];
+        payload[23] = doy_be[1];
+        payload[24] = hour;
+        payload[25] = min;
+        payload[26] = sec;
+        payload[27] = 0; // unused
+        payload[28] = 0; // ticks hi
+        payload[29] = 0; // ticks lo
+    }
+
+    // ---- Test 23: time_filtering_excludes_out_of_range ----
+
+    #[tokio::test]
+    async fn time_filtering_excludes_out_of_range() {
+        let (store, addr) = start_server().await;
+
+        // Record 1: Jan 15, 2024 (DOY 15) — within range
+        let mut payload_jan = make_payload("ANMO", "IU");
+        set_btime(&mut payload_jan, 2024, 15, 12, 0, 0);
+        store.push("IU", "ANMO", &payload_jan);
+
+        // Record 2: Feb 15, 2024 (DOY 46) — out of range
+        let mut payload_feb = make_payload("ANMO", "IU");
+        set_btime(&mut payload_feb, 2024, 46, 12, 0, 0);
+        store.push("IU", "ANMO", &payload_feb);
+
+        let config = ClientConfig {
+            prefer_v4: false,
+            ..ClientConfig::default()
+        };
+        let mut client = SeedLinkClient::connect_with_config(&addr, config)
+            .await
+            .unwrap();
+        client.station("ANMO", "IU").await.unwrap();
+        // TIME window: Jan 1 to Jan 31, 2024
+        client
+            .time_window("2024,1,1,0,0,0", Some("2024,1,31,23,59,59"))
+            .await
+            .unwrap();
+        client.data().await.unwrap();
+        client.fetch().await.unwrap();
+
+        // Should only receive seq 1 (Jan), not seq 2 (Feb)
+        let f1 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f1.sequence(), SequenceNumber::new(1));
+
+        // EOF — Feb record filtered out
+        let f2 = client.next_frame().await.unwrap();
+        assert!(f2.is_none(), "expected EOF, Feb record should be filtered");
+    }
+
+    // ---- Test 24: time_filtering_open_ended ----
+
+    #[tokio::test]
+    async fn time_filtering_open_ended() {
+        let (store, addr) = start_server().await;
+
+        // Record 1: Dec 2023 (DOY 365) — before start
+        let mut payload_dec = make_payload("ANMO", "IU");
+        set_btime(&mut payload_dec, 2023, 365, 12, 0, 0);
+        store.push("IU", "ANMO", &payload_dec);
+
+        // Record 2: Jan 15, 2024 (DOY 15) — after start
+        let mut payload_jan = make_payload("ANMO", "IU");
+        set_btime(&mut payload_jan, 2024, 15, 12, 0, 0);
+        store.push("IU", "ANMO", &payload_jan);
+
+        // Record 3: Jun 15, 2024 (DOY 167) — after start
+        let mut payload_jun = make_payload("ANMO", "IU");
+        set_btime(&mut payload_jun, 2024, 167, 12, 0, 0);
+        store.push("IU", "ANMO", &payload_jun);
+
+        let config = ClientConfig {
+            prefer_v4: false,
+            ..ClientConfig::default()
+        };
+        let mut client = SeedLinkClient::connect_with_config(&addr, config)
+            .await
+            .unwrap();
+        client.station("ANMO", "IU").await.unwrap();
+        // Open-ended TIME: from Jan 1, 2024 onwards (no end)
+        client.time_window("2024,1,1,0,0,0", None).await.unwrap();
+        client.data().await.unwrap();
+        client.fetch().await.unwrap();
+
+        // Should get seq 2 (Jan) and seq 3 (Jun), not seq 1 (Dec 2023)
+        let f1 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f1.sequence(), SequenceNumber::new(2));
+
+        let f2 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f2.sequence(), SequenceNumber::new(3));
+
+        // EOF
+        let f3 = client.next_frame().await.unwrap();
+        assert!(f3.is_none(), "expected EOF after FETCH");
+    }
+
+    // ---- Test 25: info_connections_lists_active_clients ----
+
+    #[tokio::test]
+    async fn info_connections_lists_active_clients() {
+        let (_store, addr) = start_server().await;
+
+        // Connect two clients
+        let stream1 = TcpStream::connect(&addr).await.unwrap();
+        let stream2 = TcpStream::connect(&addr).await.unwrap();
+
+        // Small yield to ensure handlers are spawned
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Use a third client to query INFO CONNECTIONS
+        let stream3 = TcpStream::connect(&addr).await.unwrap();
+        let (read_half, mut write_half) = stream3.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        write_half.write_all(b"INFO CONNECTIONS\r\n").await.unwrap();
+        write_half.flush().await.unwrap();
+
+        // Read response frames (binary SL frames + END)
+        // The response is INFO frames followed by "END\r\n"
+        // Read raw bytes until we see END
+        let mut all_data = Vec::new();
+        loop {
+            let mut buf = [0u8; 4096];
+            let n = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                tokio::io::AsyncReadExt::read(&mut reader, &mut buf),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if n == 0 {
+                break;
+            }
+            all_data.extend_from_slice(&buf[..n]);
+            // Check if we've received the END marker
+            if all_data.windows(5).any(|w| w == b"END\r\n") {
+                break;
+            }
+        }
+
+        let data_str = String::from_utf8_lossy(&all_data);
+        // Should contain at least 3 connections (client1, client2, client3)
+        let connection_count = data_str.matches("<connection ").count();
+        assert!(
+            connection_count >= 3,
+            "expected at least 3 connections, got {connection_count} in: {data_str}"
+        );
+
+        // Keep streams alive until end of test
+        drop(stream1);
+        drop(stream2);
+    }
+
+    // ---- Test 26: useragent_accepted ----
+
+    #[tokio::test]
+    async fn useragent_accepted() {
+        let (_store, addr) = start_server().await;
+
+        let stream = TcpStream::connect(&addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        write_half
+            .write_all(b"USERAGENT seedlink-rs-test/1.0\r\n")
+            .await
+            .unwrap();
+        write_half.flush().await.unwrap();
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(
+            line.starts_with("OK"),
+            "expected OK for USERAGENT, got: {line:?}"
+        );
+    }
+
+    // ---- Test 27: batch_mode_multiple_stations ----
+
+    #[tokio::test]
+    async fn batch_mode_multiple_stations() {
+        let (store, addr) = start_server().await;
+
+        store.push("IU", "ANMO", &make_payload("ANMO", "IU"));
+        store.push("GE", "WLF", &make_payload("WLF", "GE"));
+
+        let stream = TcpStream::connect(&addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Send BATCH, then multi-station setup + END
+        write_half.write_all(b"BATCH\r\n").await.unwrap();
+        write_half.flush().await.unwrap();
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(
+            line.starts_with("OK"),
+            "expected OK for BATCH, got: {line:?}"
+        );
+
+        write_half.write_all(b"STATION ANMO IU\r\n").await.unwrap();
+        write_half.flush().await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("OK"), "expected OK for STATION IU");
+
+        write_half.write_all(b"DATA\r\n").await.unwrap();
+        write_half.flush().await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("OK"), "expected OK for DATA");
+
+        write_half.write_all(b"STATION WLF GE\r\n").await.unwrap();
+        write_half.flush().await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("OK"), "expected OK for STATION GE");
+
+        write_half.write_all(b"DATA\r\n").await.unwrap();
+        write_half.flush().await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("OK"), "expected OK for DATA 2");
+
+        // Send FETCH to get buffered data then close
+        write_half.write_all(b"FETCH\r\n").await.unwrap();
+        write_half.flush().await.unwrap();
+
+        // Read two v3 frames (520 bytes each)
+        let mut frame1 = vec![0u8; v3::FRAME_LEN];
+        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut frame1)
+            .await
+            .unwrap();
+
+        let mut frame2 = vec![0u8; v3::FRAME_LEN];
+        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut frame2)
+            .await
+            .unwrap();
+
+        // Both frames should have SL signature
+        assert_eq!(&frame1[0..2], b"SL");
+        assert_eq!(&frame2[0..2], b"SL");
+    }
+
+    // ---- Test 28: connection_unregistered_on_disconnect ----
+
+    #[tokio::test]
+    async fn connection_unregistered_on_disconnect() {
+        let (_store, addr) = start_server().await;
+
+        // Connect a client
+        let stream = TcpStream::connect(&addr).await.unwrap();
+        let (_read_half, mut write_half) = stream.into_split();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Count connections via INFO CONNECTIONS from another client
+        let count_before = {
+            let s = TcpStream::connect(&addr).await.unwrap();
+            let (rh, mut wh) = s.into_split();
+            let mut r = BufReader::new(rh);
+            wh.write_all(b"INFO CONNECTIONS\r\n").await.unwrap();
+            wh.flush().await.unwrap();
+
+            let mut all = Vec::new();
+            loop {
+                let mut buf = [0u8; 4096];
+                let n = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    tokio::io::AsyncReadExt::read(&mut r, &mut buf),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                if n == 0 {
+                    break;
+                }
+                all.extend_from_slice(&buf[..n]);
+                if all.windows(5).any(|w| w == b"END\r\n") {
+                    break;
+                }
+            }
+            let data = String::from_utf8_lossy(&all);
+            data.matches("<connection ").count()
+        };
+
+        // Disconnect the first client via BYE
+        write_half.write_all(b"BYE\r\n").await.unwrap();
+        write_half.flush().await.unwrap();
+        // Wait for handler to process BYE and unregister
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(_read_half);
+
+        // Count connections again
+        let count_after = {
+            let s = TcpStream::connect(&addr).await.unwrap();
+            let (rh, mut wh) = s.into_split();
+            let mut r = BufReader::new(rh);
+            wh.write_all(b"INFO CONNECTIONS\r\n").await.unwrap();
+            wh.flush().await.unwrap();
+
+            let mut all = Vec::new();
+            loop {
+                let mut buf = [0u8; 4096];
+                let n = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    tokio::io::AsyncReadExt::read(&mut r, &mut buf),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                if n == 0 {
+                    break;
+                }
+                all.extend_from_slice(&buf[..n]);
+                if all.windows(5).any(|w| w == b"END\r\n") {
+                    break;
+                }
+            }
+            let data = String::from_utf8_lossy(&all);
+            data.matches("<connection ").count()
+        };
+
+        // After the first client disconnected, there should be fewer connections.
+        // count_before includes: first client + query client
+        // count_after includes: only the new query client (first client disconnected)
+        assert!(
+            count_after < count_before,
+            "expected fewer connections after BYE: before={count_before}, after={count_after}"
+        );
     }
 }

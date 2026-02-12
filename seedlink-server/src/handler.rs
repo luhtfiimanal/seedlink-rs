@@ -5,9 +5,11 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch;
 use tracing::{debug, info, trace};
 
+use crate::connections::ConnectionRegistry;
 use crate::info as info_xml;
 use crate::select::SelectPattern;
 use crate::store::{DataStore, Record, Subscription};
+use crate::time::TimeWindow;
 
 /// Per-client connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +38,8 @@ pub(crate) struct ClientHandler {
     subscriptions: Vec<Subscription>,
     resume_seq: Option<u64>,
     shutdown_rx: watch::Receiver<bool>,
+    conn_id: u64,
+    connections: ConnectionRegistry,
 }
 
 impl ClientHandler {
@@ -45,6 +49,8 @@ impl ClientHandler {
         store: DataStore,
         config: HandlerConfig,
         shutdown_rx: watch::Receiver<bool>,
+        conn_id: u64,
+        connections: ConnectionRegistry,
     ) -> Self {
         Self {
             reader: BufReader::new(read_half),
@@ -56,6 +62,8 @@ impl ClientHandler {
             subscriptions: Vec::new(),
             resume_seq: None,
             shutdown_rx,
+            conn_id,
+            connections,
         }
     }
 
@@ -109,6 +117,7 @@ impl ClientHandler {
             }
         }
 
+        self.connections.unregister(self.conn_id);
         info!("client disconnected");
     }
 
@@ -127,6 +136,9 @@ impl ClientHandler {
             Command::SlProto { version } => {
                 if version == "4.0" {
                     self.protocol_version = ProtocolVersion::V4;
+                    self.connections.update(self.conn_id, |info| {
+                        info.protocol_version = ProtocolVersion::V4;
+                    });
                     debug!("negotiated v4");
                     self.send_response(&Response::Ok).await.is_ok()
                 } else {
@@ -142,8 +154,12 @@ impl ClientHandler {
                     network,
                     station,
                     select_patterns: Vec::new(),
+                    time_window: None,
                 });
                 self.state = State::Configured;
+                self.connections.update(self.conn_id, |info| {
+                    info.state = "Configured".to_owned();
+                });
                 self.send_response(&Response::Ok).await.is_ok()
             }
             Command::Select { pattern } => {
@@ -178,21 +194,55 @@ impl ClientHandler {
                 }
                 // No response for FETCH — binary streaming starts immediately
                 self.state = State::Streaming;
+                self.connections.update(self.conn_id, |info| {
+                    info.state = "Streaming".to_owned();
+                });
                 self.stream_frames(false).await;
                 false // streaming ended, close connection
             }
-            Command::Time { .. } => {
-                // Accept but ignore time filtering (deferred to Chunk 3)
-                self.send_response(&Response::Ok).await.is_ok()
+            Command::Time { start, end } => {
+                if let Some(sub) = self.subscriptions.last_mut() {
+                    if let Some(tw) = TimeWindow::parse(&start, end.as_deref()) {
+                        sub.time_window = Some(tw);
+                        self.send_response(&Response::Ok).await.is_ok()
+                    } else {
+                        let resp = Response::Error {
+                            code: Some(seedlink_rs_protocol::response::ErrorCode::Unsupported),
+                            description: format!("invalid TIME format: {start}"),
+                        };
+                        self.send_response(&resp).await.is_ok()
+                    }
+                } else {
+                    let resp = Response::Error {
+                        code: Some(seedlink_rs_protocol::response::ErrorCode::Unsupported),
+                        description: "TIME requires prior STATION".to_owned(),
+                    };
+                    self.send_response(&resp).await.is_ok()
+                }
             }
             Command::End => {
                 // No response for END — binary streaming starts immediately
                 self.state = State::Streaming;
+                self.connections.update(self.conn_id, |info| {
+                    info.state = "Streaming".to_owned();
+                });
                 self.stream_frames(true).await;
                 false // streaming ended, close connection
             }
             Command::Bye => false,
             Command::Info { level } => self.handle_info(level).await,
+            Command::UserAgent { description } => {
+                self.connections.update(self.conn_id, |info| {
+                    info.user_agent = Some(description.clone());
+                });
+                self.send_response(&Response::Ok).await.is_ok()
+            }
+            Command::Batch => {
+                // Our handler already accumulates STATION+SELECT+DATA before END.
+                // BATCH mode just suppresses per-command responses, but for simplicity
+                // we acknowledge it.
+                self.send_response(&Response::Ok).await.is_ok()
+            }
             _ => {
                 let resp = Response::Error {
                     code: Some(seedlink_rs_protocol::response::ErrorCode::Unsupported),
@@ -285,6 +335,10 @@ impl ClientHandler {
             InfoLevel::Streams => {
                 let streams = self.store.stream_info();
                 info_xml::build_info_streams_xml(&streams)
+            }
+            InfoLevel::Connections => {
+                let conns = self.connections.snapshot();
+                info_xml::build_info_connections_xml(&conns)
             }
             _ => {
                 let resp = Response::Error {

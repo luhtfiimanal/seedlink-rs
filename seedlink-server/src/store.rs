@@ -6,6 +6,7 @@ use seedlink_rs_protocol::frame::v3;
 use tokio::sync::Notify;
 
 use crate::select::SelectPattern;
+use crate::time::{TimeWindow, Timestamp};
 
 /// A single record in the ring buffer.
 #[derive(Clone, Debug)]
@@ -16,12 +17,13 @@ pub struct Record {
     pub payload: Vec<u8>,
 }
 
-/// Station subscription filter (network + station + optional SELECT patterns).
+/// Station subscription filter (network + station + optional SELECT/TIME filters).
 #[derive(Clone, Debug)]
 pub(crate) struct Subscription {
     pub network: String,
     pub station: String,
     pub select_patterns: Vec<SelectPattern>,
+    pub time_window: Option<TimeWindow>,
 }
 
 impl Subscription {
@@ -36,6 +38,21 @@ impl Subscription {
         self.select_patterns
             .iter()
             .any(|p| p.matches_payload(payload))
+    }
+
+    /// Check if a payload's BTime timestamp falls within the TIME window.
+    ///
+    /// - `None` time_window → pass all (no TIME = no filter)
+    /// - `Some(tw)` → parse BTime from payload, check `tw.contains()`
+    /// - Unparseable BTime → reject (return false)
+    pub fn matches_time(&self, payload: &[u8]) -> bool {
+        let Some(ref tw) = self.time_window else {
+            return true;
+        };
+        match Timestamp::from_mseed_payload(payload) {
+            Some(ts) => tw.contains(ts),
+            None => false,
+        }
     }
 }
 
@@ -108,6 +125,7 @@ impl Ring {
                     s.network.eq_ignore_ascii_case(&r.network)
                         && s.station.eq_ignore_ascii_case(&r.station)
                         && s.matches_channel(&r.payload)
+                        && s.matches_time(&r.payload)
                 })
             })
             .cloned()
@@ -286,6 +304,7 @@ mod tests {
             network: "IU".into(),
             station: "ANMO".into(),
             select_patterns: vec![],
+            time_window: None,
         }];
 
         let records = store.read_since(0, &subs);
@@ -305,6 +324,7 @@ mod tests {
             network: "IU".into(),
             station: "ANMO".into(),
             select_patterns: vec![],
+            time_window: None,
         }];
 
         let records = store.read_since(2, &subs);
@@ -323,6 +343,7 @@ mod tests {
             network: "IU".into(),
             station: "ANMO".into(),
             select_patterns: vec![],
+            time_window: None,
         }];
 
         let records = store.read_since(0, &subs);

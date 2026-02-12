@@ -1,5 +1,7 @@
-//! XML generation for SeedLink INFO responses (ID, STATIONS, STREAMS).
+//! XML generation for SeedLink INFO responses (ID, STATIONS, STREAMS, CONNECTIONS).
 
+use crate::connections::ConnectionInfo;
+use crate::format_timestamp;
 use crate::store::{StationInfo, StreamInfo};
 
 /// Escape XML special characters in attribute values.
@@ -78,6 +80,27 @@ pub(crate) fn build_info_streams_xml(streams: &[StreamInfo]) -> String {
 
     if current_station.is_some() {
         xml.push_str("  </station>\n");
+    }
+    xml.push_str("</seedlink>\n");
+    xml
+}
+
+/// Build INFO CONNECTIONS XML response.
+pub(crate) fn build_info_connections_xml(connections: &[ConnectionInfo]) -> String {
+    let mut xml = String::from("<?xml version=\"1.0\"?>\n<seedlink>\n");
+    for c in connections {
+        let ctime = format_timestamp(c.connected_at);
+        let host = xml_escape(&c.addr.to_string());
+        let port = c.addr.port();
+        let ua = c.user_agent.as_deref().map(xml_escape).unwrap_or_default();
+        let proto = match c.protocol_version {
+            seedlink_rs_protocol::ProtocolVersion::V3 => "3.1",
+            seedlink_rs_protocol::ProtocolVersion::V4 => "4.0",
+        };
+        xml.push_str(&format!(
+            "  <connection host=\"{host}\" port=\"{port}\" ctime=\"{ctime}\" proto=\"{proto}\" useragent=\"{ua}\" state=\"{}\"/>\n",
+            xml_escape(&c.state),
+        ));
     }
     xml.push_str("</seedlink>\n");
     xml
