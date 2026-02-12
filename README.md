@@ -35,24 +35,25 @@ async fn main() -> seedlink_rs_client::Result<()> {
 ## Status
 
 **seedlink-rs-protocol** and **seedlink-rs-client** are published and functional.
-Tested against IRIS (`rtserve.iris.washington.edu:18000`) with 139 tests passing.
+Tested against IRIS (`rtserve.iris.washington.edu:18000`) with 154 tests passing.
 
 ### What works today
 
 - SeedLink v3 and v4 protocol negotiation
 - Station/channel selection, DATA, FETCH, END, INFO, BYE
+- `TIME` command for time-windowed data requests (v3)
 - Sequence tracking and resume from last sequence
+- `futures::Stream` impl via `frame_stream()` / `into_stream()`
+- Auto-reconnect with exponential backoff and per-station sequence resume
+- Built-in deduplication — downstream never sees duplicate frames after reconnect
+- miniSEED decode via [miniseed-rs](https://github.com/luhtfiimanal/miniseed-rs) integration
+- `tracing` integration for structured logging
 - Configurable connect and read timeouts
 - Clean EOF handling (`next_frame()` returns `None`)
 
 ### Roadmap
 
-- [ ] `TIME` command — time-windowed data requests (v3)
-- [ ] `futures::Stream` impl for frame iteration
-- [ ] Auto-reconnect with backoff
-- [ ] `tracing` integration for structured logging
 - [ ] `seedlink-rs-server` — async SeedLink server for data distribution
-- [ ] miniSEED decode integration with [miniseed-rs](https://github.com/luhtfiimanal/miniseed-rs)
 
 ## License
 

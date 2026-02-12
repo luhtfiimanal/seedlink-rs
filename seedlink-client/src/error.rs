@@ -39,6 +39,13 @@ pub enum ClientError {
     /// Server sent an unexpected response line.
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),
+
+    /// Auto-reconnect exhausted all retry attempts.
+    #[error("reconnect failed after {attempts} attempts")]
+    ReconnectFailed {
+        /// Number of reconnect attempts made.
+        attempts: u32,
+    },
 }
 
 /// Convenience alias for `Result<T, ClientError>`.

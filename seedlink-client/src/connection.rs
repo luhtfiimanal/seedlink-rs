@@ -5,6 +5,7 @@ use seedlink_rs_protocol::{Command, ProtocolVersion};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tracing::{debug, trace, warn};
 
 use crate::error::{ClientError, Result};
 use crate::state::OwnedFrame;
@@ -21,6 +22,7 @@ impl Connection {
         connect_timeout: Duration,
         read_timeout: Duration,
     ) -> Result<Self> {
+        debug!(addr, "TCP connecting");
         let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| ClientError::Timeout(connect_timeout))?
@@ -37,6 +39,7 @@ impl Connection {
     }
 
     pub async fn send_command(&mut self, cmd: &Command, version: ProtocolVersion) -> Result<()> {
+        trace!(?cmd, "sending");
         let bytes = cmd.to_bytes(version)?;
         self.send_raw(&bytes).await
     }
@@ -51,7 +54,10 @@ impl Connection {
         let mut line = String::new();
         let n = tokio::time::timeout(self.read_timeout, self.reader.read_line(&mut line))
             .await
-            .map_err(|_| ClientError::Timeout(self.read_timeout))?
+            .map_err(|_| {
+                warn!(timeout = ?self.read_timeout, "read timeout");
+                ClientError::Timeout(self.read_timeout)
+            })?
             .map_err(ClientError::Io)?;
         if n == 0 {
             return Err(ClientError::Disconnected);

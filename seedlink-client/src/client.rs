@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
+use futures_core::Stream;
 use seedlink_rs_protocol::{Command, InfoLevel, ProtocolVersion, Response, SequenceNumber};
+use tracing::{debug, info, trace, warn};
 
 use crate::connection::Connection;
 use crate::error::{ClientError, Result};
@@ -53,6 +55,7 @@ impl SeedLinkClient {
     /// Performs TCP connect, sends HELLO, and optionally negotiates v4.
     /// On success the client is in [`ClientState::Connected`].
     pub async fn connect_with_config(addr: &str, config: ClientConfig) -> Result<Self> {
+        info!(addr, "connecting");
         let mut connection =
             Connection::connect(addr, config.connect_timeout, config.read_timeout).await?;
 
@@ -101,7 +104,7 @@ impl SeedLinkClient {
                     protocol_version = ProtocolVersion::V4;
                 }
                 Response::Error { description, .. } => {
-                    eprintln!("v4 negotiation failed: {description}, falling back to v3");
+                    warn!(%description, "v4 negotiation failed, falling back to v3");
                 }
                 _ => {
                     return Err(ClientError::UnexpectedResponse(format!(
@@ -117,6 +120,8 @@ impl SeedLinkClient {
             organization,
             capabilities,
         };
+
+        info!(version = ?protocol_version, "connected");
 
         Ok(Self {
             connection,
@@ -162,6 +167,7 @@ impl SeedLinkClient {
             "station",
         )?;
 
+        debug!(station, network, "STATION");
         let cmd = Command::Station {
             station: station.to_owned(),
             network: network.to_owned(),
@@ -182,6 +188,7 @@ impl SeedLinkClient {
     pub async fn select(&mut self, pattern: &str) -> Result<()> {
         self.require_state_in(&[ClientState::Connected, ClientState::Configured], "select")?;
 
+        debug!(pattern, "SELECT");
         let cmd = Command::Select {
             pattern: pattern.to_owned(),
         };
@@ -204,6 +211,7 @@ impl SeedLinkClient {
     pub async fn data(&mut self) -> Result<()> {
         self.require_state_in(&[ClientState::Configured], "data")?;
 
+        debug!("DATA");
         let cmd = Command::Data {
             sequence: None,
             start: None,
@@ -224,6 +232,7 @@ impl SeedLinkClient {
     pub async fn data_from(&mut self, sequence: SequenceNumber) -> Result<()> {
         self.require_state_in(&[ClientState::Configured], "data_from")?;
 
+        debug!(%sequence, "DATA (resume)");
         let cmd = Command::Data {
             sequence: Some(sequence),
             start: None,
@@ -233,6 +242,26 @@ impl SeedLinkClient {
 
         // Server replies OK/ERROR
         self.read_ok_response("DATA").await?;
+
+        // State stays Configured — END triggers streaming
+        Ok(())
+    }
+
+    /// Arm the current station subscription with a time window (v3 only).
+    ///
+    /// Sends `TIME start [end]` to request data within a specific time range.
+    /// Requires state `Configured`. State stays `Configured`.
+    pub async fn time_window(&mut self, start: &str, end: Option<&str>) -> Result<()> {
+        self.require_state_in(&[ClientState::Configured], "time_window")?;
+
+        debug!(start, ?end, "TIME");
+        let cmd = Command::Time {
+            start: start.to_owned(),
+            end: end.map(|s| s.to_owned()),
+        };
+        self.connection.send_command(&cmd, self.version).await?;
+
+        self.read_ok_response("TIME").await?;
 
         // State stays Configured — END triggers streaming
         Ok(())
@@ -304,6 +333,7 @@ impl SeedLinkClient {
 
         match result {
             Ok(frame) => {
+                trace!(sequence = %frame.sequence(), "frame received");
                 self.track_sequence(&frame);
                 Ok(Some(frame))
             }
@@ -317,6 +347,16 @@ impl SeedLinkClient {
             }
             Err(e) => Err(e),
         }
+    }
+
+    // -- Stream conversion --
+
+    /// Consume this client and return a [`Stream`] of frames.
+    ///
+    /// The client must be in `Streaming` state. The stream yields
+    /// `Ok(OwnedFrame)` per frame and ends with `None` on EOF.
+    pub fn into_stream(self) -> impl Stream<Item = Result<OwnedFrame>> {
+        crate::stream::frame_stream(self)
     }
 
     // -- Utility (any state) --
@@ -561,8 +601,10 @@ mod tests {
             hello_line1: "SeedLink v3.1 :: SLPROTO:4.0".to_owned(),
             hello_line2: "Fake v4 Server".to_owned(),
             frames: vec![make_v3_frame(1, "ANMO", "IU")],
+            connection_frames: None,
             accept_slproto: false,
             close_after_stream: false,
+            max_connections: 1,
         };
         let server = MockServer::start(config).await;
 
@@ -955,5 +997,57 @@ mod tests {
         let frame = client.next_frame().await.unwrap();
         assert!(frame.is_none());
         assert_eq!(client.state(), ClientState::Disconnected);
+    }
+
+    // -- TIME window --
+
+    #[tokio::test]
+    async fn time_window_v3_flow() {
+        let frames = vec![make_v3_frame(1, "ANMO", "IU")];
+        let server = MockServer::start(MockConfig::v3_default(frames)).await;
+
+        let mut client = SeedLinkClient::connect(&server.addr().to_string())
+            .await
+            .unwrap();
+
+        client.station("ANMO", "IU").await.unwrap();
+        client.time_window("2024,1,0,0,0", None).await.unwrap();
+        assert_eq!(client.state(), ClientState::Configured);
+
+        client.end_stream().await.unwrap();
+        assert_eq!(client.state(), ClientState::Streaming);
+
+        let frame = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame.sequence(), SequenceNumber::new(1));
+    }
+
+    #[tokio::test]
+    async fn time_window_with_end() {
+        let frames = vec![make_v3_frame(1, "ANMO", "IU")];
+        let server = MockServer::start(MockConfig::v3_default(frames)).await;
+
+        let mut client = SeedLinkClient::connect(&server.addr().to_string())
+            .await
+            .unwrap();
+
+        client.station("ANMO", "IU").await.unwrap();
+        client
+            .time_window("2024,1,0,0,0", Some("2024,2,0,0,0"))
+            .await
+            .unwrap();
+        assert_eq!(client.state(), ClientState::Configured);
+    }
+
+    #[tokio::test]
+    async fn time_window_requires_configured() {
+        let server = MockServer::start(MockConfig::v3_default(vec![])).await;
+
+        let mut client = SeedLinkClient::connect(&server.addr().to_string())
+            .await
+            .unwrap();
+
+        // Connected, not Configured — should fail
+        let err = client.time_window("2024,1,0,0,0", None).await.unwrap_err();
+        assert!(matches!(err, ClientError::InvalidState { .. }));
     }
 }

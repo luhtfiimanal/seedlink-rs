@@ -110,6 +110,70 @@ impl OwnedFrame {
             Self::V3 { payload, .. } | Self::V4 { payload, .. } => payload,
         }
     }
+
+    /// Extract the station key (network + station) from the frame.
+    ///
+    /// For V3, parses station (bytes 8–12) and network (bytes 18–19) from the
+    /// miniSEED payload header. For V4, splits `station_id` on `'_'`.
+    ///
+    /// Returns `None` if the payload is too short or station info is unreadable.
+    pub fn station_key(&self) -> Option<StationKey> {
+        match self {
+            Self::V3 { payload, .. } => {
+                if payload.len() >= 20 {
+                    let station = std::str::from_utf8(&payload[8..13]).ok()?.trim().to_owned();
+                    let network = std::str::from_utf8(&payload[18..20])
+                        .ok()?
+                        .trim()
+                        .to_owned();
+                    if !station.is_empty() && !network.is_empty() {
+                        Some(StationKey { network, station })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            Self::V4 { station_id, .. } => {
+                station_id
+                    .split_once('_')
+                    .map(|(network, station)| StationKey {
+                        network: network.to_owned(),
+                        station: station.to_owned(),
+                    })
+            }
+        }
+    }
+
+    /// Decode the payload as a miniSEED record.
+    ///
+    /// Delegates to [`RawFrame::decode()`] on a borrowed view of this frame.
+    pub fn decode(&self) -> seedlink_rs_protocol::Result<seedlink_rs_protocol::DataFrame> {
+        self.as_raw_frame().decode()
+    }
+
+    fn as_raw_frame(&self) -> RawFrame<'_> {
+        match self {
+            Self::V3 { sequence, payload } => RawFrame::V3 {
+                sequence: *sequence,
+                payload,
+            },
+            Self::V4 {
+                format,
+                subformat,
+                sequence,
+                station_id,
+                payload,
+            } => RawFrame::V4 {
+                format: *format,
+                subformat: *subformat,
+                sequence: *sequence,
+                station_id,
+                payload,
+            },
+        }
+    }
 }
 
 impl<'a> From<RawFrame<'a>> for OwnedFrame {
@@ -133,5 +197,30 @@ impl<'a> From<RawFrame<'a>> for OwnedFrame {
                 payload: payload.to_vec(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_zeroed_payload_returns_err() {
+        let frame = OwnedFrame::V3 {
+            sequence: SequenceNumber::new(1),
+            payload: vec![0u8; 512],
+        };
+        assert!(frame.decode().is_err());
+    }
+
+    #[test]
+    fn as_raw_frame_roundtrip() {
+        let frame = OwnedFrame::V3 {
+            sequence: SequenceNumber::new(42),
+            payload: vec![0xAA; 512],
+        };
+        let raw = frame.as_raw_frame();
+        assert_eq!(raw.sequence(), SequenceNumber::new(42));
+        assert_eq!(raw.payload().len(), 512);
     }
 }

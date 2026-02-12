@@ -28,8 +28,14 @@ pub(crate) mod error;
 #[cfg(test)]
 pub(crate) mod mock;
 pub(crate) mod negotiate;
+pub(crate) mod reconnect;
 pub(crate) mod state;
+pub(crate) mod stream;
 
 pub use client::SeedLinkClient;
 pub use error::{ClientError, Result};
+pub use futures_core::Stream;
+pub use reconnect::{ReconnectConfig, ReconnectingClient};
+pub use seedlink_rs_protocol::DataFrame;
 pub use state::{ClientConfig, ClientState, OwnedFrame, ServerInfo, StationKey};
+pub use stream::frame_stream;
