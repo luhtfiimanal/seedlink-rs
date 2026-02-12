@@ -23,17 +23,78 @@
 
 pub mod error;
 pub(crate) mod handler;
+pub(crate) mod info;
+pub(crate) mod select;
 pub mod store;
 
 pub use error::{Result, ServerError};
 pub use store::DataStore;
 
 use std::net::SocketAddr;
+use std::time::SystemTime;
 
 use handler::{ClientHandler, HandlerConfig};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{info, warn};
+
+/// Format a SystemTime as "YYYY/MM/DD HH:MM:SS" without chrono.
+fn format_timestamp(time: SystemTime) -> String {
+    let dur = time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+
+    // Simple civil time calculation (UTC)
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Days since 1970-01-01
+    let mut y = 1970i64;
+    let mut remaining_days = days as i64;
+    loop {
+        let days_in_year = if is_leap(y) { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        y += 1;
+    }
+    let leap = is_leap(y);
+    let month_days: [i64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut m = 0;
+    for &md in &month_days {
+        if remaining_days < md {
+            break;
+        }
+        remaining_days -= md;
+        m += 1;
+    }
+    let d = remaining_days + 1;
+    let month = m + 1;
+
+    format!("{y:04}/{month:02}/{d:02} {hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
 
 /// Configuration for [`SeedLinkServer`].
 #[derive(Clone, Debug)]
@@ -82,6 +143,7 @@ pub struct SeedLinkServer {
     listener: TcpListener,
     config: ServerConfig,
     store: DataStore,
+    started: String,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 }
@@ -96,12 +158,14 @@ impl SeedLinkServer {
     pub async fn bind_with_config(addr: &str, config: ServerConfig) -> Result<Self> {
         let listener = TcpListener::bind(addr).await.map_err(ServerError::Bind)?;
         let store = DataStore::new(config.ring_capacity);
+        let started = format_timestamp(SystemTime::now());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         info!(addr, "server bound");
         Ok(Self {
             listener,
             config,
             store,
+            started,
             shutdown_tx,
             shutdown_rx,
         })
@@ -154,6 +218,7 @@ impl SeedLinkServer {
                 software: self.config.software.clone(),
                 version: self.config.version.clone(),
                 organization: self.config.organization.clone(),
+                started: self.started.clone(),
             };
             let shutdown_rx = self.shutdown_rx.clone();
 
@@ -624,5 +689,280 @@ mod tests {
             result.is_err() || result.unwrap().is_err(),
             "expected new connection to fail after shutdown"
         );
+    }
+
+    // ---- Test 16: info_id_returns_xml ----
+
+    #[tokio::test]
+    async fn info_id_returns_xml() {
+        let (_store, addr) = start_server().await;
+
+        let config = ClientConfig {
+            prefer_v4: false,
+            ..ClientConfig::default()
+        };
+        let mut client = SeedLinkClient::connect_with_config(&addr, config)
+            .await
+            .unwrap();
+
+        let frames = client
+            .info(seedlink_rs_protocol::InfoLevel::Id)
+            .await
+            .unwrap();
+        assert!(!frames.is_empty(), "expected at least one INFO frame");
+
+        // Extract XML from the frame payload (null-padded)
+        let payload = frames[0].payload();
+        let xml = String::from_utf8_lossy(payload);
+        let xml = xml.trim_end_matches('\0');
+        assert!(
+            xml.contains("software="),
+            "XML should contain software attribute: {xml}"
+        );
+        assert!(
+            xml.contains("organization="),
+            "XML should contain organization attribute: {xml}"
+        );
+        assert!(
+            xml.contains("seedlink-rs"),
+            "XML should mention seedlink-rs: {xml}"
+        );
+    }
+
+    // ---- Test 17: info_stations_returns_pushed_stations ----
+
+    #[tokio::test]
+    async fn info_stations_returns_pushed_stations() {
+        let (store, addr) = start_server().await;
+
+        store.push("IU", "ANMO", &make_payload("ANMO", "IU"));
+        store.push("GE", "WLF", &make_payload("WLF", "GE"));
+
+        let config = ClientConfig {
+            prefer_v4: false,
+            ..ClientConfig::default()
+        };
+        let mut client = SeedLinkClient::connect_with_config(&addr, config)
+            .await
+            .unwrap();
+
+        let frames = client
+            .info(seedlink_rs_protocol::InfoLevel::Stations)
+            .await
+            .unwrap();
+        assert!(!frames.is_empty());
+
+        // Combine all frame payloads into one XML string
+        let mut xml = String::new();
+        for f in &frames {
+            let payload = f.payload();
+            let s = String::from_utf8_lossy(payload);
+            xml.push_str(s.trim_end_matches('\0'));
+        }
+        assert!(xml.contains("name=\"ANMO\""), "should list ANMO: {xml}");
+        assert!(xml.contains("name=\"WLF\""), "should list WLF: {xml}");
+        assert!(xml.contains("network=\"IU\""), "should list IU: {xml}");
+        assert!(xml.contains("network=\"GE\""), "should list GE: {xml}");
+    }
+
+    // ---- Test 18: info_streams_returns_channel_detail ----
+
+    #[tokio::test]
+    async fn info_streams_returns_channel_detail() {
+        let (store, addr) = start_server().await;
+
+        let mut payload = make_payload("ANMO", "IU");
+        // Set channel BHZ at bytes 15..18, location 00 at bytes 13..15, type D at byte 6
+        payload[6] = b'D';
+        payload[13] = b'0';
+        payload[14] = b'0';
+        payload[15] = b'B';
+        payload[16] = b'H';
+        payload[17] = b'Z';
+        store.push("IU", "ANMO", &payload);
+
+        let config = ClientConfig {
+            prefer_v4: false,
+            ..ClientConfig::default()
+        };
+        let mut client = SeedLinkClient::connect_with_config(&addr, config)
+            .await
+            .unwrap();
+
+        let frames = client
+            .info(seedlink_rs_protocol::InfoLevel::Streams)
+            .await
+            .unwrap();
+        assert!(!frames.is_empty());
+
+        let mut xml = String::new();
+        for f in &frames {
+            let payload = f.payload();
+            let s = String::from_utf8_lossy(payload);
+            xml.push_str(s.trim_end_matches('\0'));
+        }
+        assert!(xml.contains("seedname=\"BHZ\""), "should list BHZ: {xml}");
+        assert!(
+            xml.contains("location=\"00\""),
+            "should list location 00: {xml}"
+        );
+        assert!(xml.contains("type=\"D\""), "should list type D: {xml}");
+    }
+
+    // ---- Test 19: info_unsupported_level_returns_error ----
+
+    #[tokio::test]
+    async fn info_unsupported_level_returns_error() {
+        let (_store, addr) = start_server().await;
+
+        let stream = TcpStream::connect(&addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        write_half.write_all(b"INFO CONNECTIONS\r\n").await.unwrap();
+        write_half.flush().await.unwrap();
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(
+            line.starts_with("ERROR"),
+            "expected ERROR for unsupported INFO level, got: {line:?}"
+        );
+    }
+
+    // ---- Test 20: select_filters_by_channel ----
+
+    #[tokio::test]
+    async fn select_filters_by_channel() {
+        let (store, addr) = start_server().await;
+
+        // Push BHZ record
+        let mut payload_bhz = make_payload("ANMO", "IU");
+        payload_bhz[15] = b'B';
+        payload_bhz[16] = b'H';
+        payload_bhz[17] = b'Z';
+        store.push("IU", "ANMO", &payload_bhz);
+
+        // Push BHN record
+        let mut payload_bhn = make_payload("ANMO", "IU");
+        payload_bhn[15] = b'B';
+        payload_bhn[16] = b'H';
+        payload_bhn[17] = b'N';
+        store.push("IU", "ANMO", &payload_bhn);
+
+        // Push another BHZ record
+        store.push("IU", "ANMO", &payload_bhz);
+
+        let config = ClientConfig {
+            prefer_v4: false,
+            ..ClientConfig::default()
+        };
+        let mut client = SeedLinkClient::connect_with_config(&addr, config)
+            .await
+            .unwrap();
+        client.station("ANMO", "IU").await.unwrap();
+        client.select("BHZ").await.unwrap();
+        client.data().await.unwrap();
+        client.fetch().await.unwrap();
+
+        // Should only receive seq 1 and 3 (BHZ), not seq 2 (BHN)
+        let f1 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f1.sequence(), SequenceNumber::new(1));
+
+        let f2 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f2.sequence(), SequenceNumber::new(3));
+
+        // EOF
+        let f3 = client.next_frame().await.unwrap();
+        assert!(f3.is_none(), "expected EOF after FETCH");
+    }
+
+    // ---- Test 21: select_wildcard_pattern ----
+
+    #[tokio::test]
+    async fn select_wildcard_pattern() {
+        let (store, addr) = start_server().await;
+
+        let mut payload_bhz = make_payload("ANMO", "IU");
+        payload_bhz[15] = b'B';
+        payload_bhz[16] = b'H';
+        payload_bhz[17] = b'Z';
+        store.push("IU", "ANMO", &payload_bhz);
+
+        let mut payload_bhn = make_payload("ANMO", "IU");
+        payload_bhn[15] = b'B';
+        payload_bhn[16] = b'H';
+        payload_bhn[17] = b'N';
+        store.push("IU", "ANMO", &payload_bhn);
+
+        let mut payload_lhz = make_payload("ANMO", "IU");
+        payload_lhz[15] = b'L';
+        payload_lhz[16] = b'H';
+        payload_lhz[17] = b'Z';
+        store.push("IU", "ANMO", &payload_lhz);
+
+        let config = ClientConfig {
+            prefer_v4: false,
+            ..ClientConfig::default()
+        };
+        let mut client = SeedLinkClient::connect_with_config(&addr, config)
+            .await
+            .unwrap();
+        client.station("ANMO", "IU").await.unwrap();
+        client.select("BH?").await.unwrap();
+        client.data().await.unwrap();
+        client.fetch().await.unwrap();
+
+        // Should receive BHZ (seq 1) and BHN (seq 2), but not LHZ (seq 3)
+        let f1 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f1.sequence(), SequenceNumber::new(1));
+
+        let f2 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f2.sequence(), SequenceNumber::new(2));
+
+        // EOF
+        let f3 = client.next_frame().await.unwrap();
+        assert!(f3.is_none(), "expected EOF after FETCH");
+    }
+
+    // ---- Test 22: no_select_matches_all_channels ----
+
+    #[tokio::test]
+    async fn no_select_matches_all_channels() {
+        let (store, addr) = start_server().await;
+
+        let mut payload_bhz = make_payload("ANMO", "IU");
+        payload_bhz[15] = b'B';
+        payload_bhz[16] = b'H';
+        payload_bhz[17] = b'Z';
+        store.push("IU", "ANMO", &payload_bhz);
+
+        let mut payload_bhn = make_payload("ANMO", "IU");
+        payload_bhn[15] = b'B';
+        payload_bhn[16] = b'H';
+        payload_bhn[17] = b'N';
+        store.push("IU", "ANMO", &payload_bhn);
+
+        let config = ClientConfig {
+            prefer_v4: false,
+            ..ClientConfig::default()
+        };
+        let mut client = SeedLinkClient::connect_with_config(&addr, config)
+            .await
+            .unwrap();
+        client.station("ANMO", "IU").await.unwrap();
+        // No SELECT — should match all channels
+        client.data().await.unwrap();
+        client.fetch().await.unwrap();
+
+        let f1 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f1.sequence(), SequenceNumber::new(1));
+
+        let f2 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f2.sequence(), SequenceNumber::new(2));
+
+        // EOF
+        let f3 = client.next_frame().await.unwrap();
+        assert!(f3.is_none(), "expected EOF after FETCH");
     }
 }

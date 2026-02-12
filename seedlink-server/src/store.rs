@@ -1,9 +1,11 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use seedlink_rs_protocol::SequenceNumber;
 use seedlink_rs_protocol::frame::v3;
 use tokio::sync::Notify;
+
+use crate::select::SelectPattern;
 
 /// A single record in the ring buffer.
 #[derive(Clone, Debug)]
@@ -14,11 +16,48 @@ pub struct Record {
     pub payload: Vec<u8>,
 }
 
-/// Station subscription filter (network + station).
+/// Station subscription filter (network + station + optional SELECT patterns).
 #[derive(Clone, Debug)]
 pub(crate) struct Subscription {
     pub network: String,
     pub station: String,
+    pub select_patterns: Vec<SelectPattern>,
+}
+
+impl Subscription {
+    /// Check if a payload matches this subscription's SELECT patterns.
+    ///
+    /// Empty `select_patterns` → match all (no SELECT = all channels).
+    /// Non-empty → any pattern matches = pass (OR logic).
+    pub fn matches_channel(&self, payload: &[u8]) -> bool {
+        if self.select_patterns.is_empty() {
+            return true;
+        }
+        self.select_patterns
+            .iter()
+            .any(|p| p.matches_payload(payload))
+    }
+}
+
+/// Station info returned by `DataStore::station_info()`.
+#[derive(Clone, Debug)]
+pub(crate) struct StationInfo {
+    pub network: String,
+    pub station: String,
+    pub begin_seq: u64,
+    pub end_seq: u64,
+}
+
+/// Stream info returned by `DataStore::stream_info()`.
+#[derive(Clone, Debug)]
+pub(crate) struct StreamInfo {
+    pub network: String,
+    pub station: String,
+    pub channel: String,
+    pub location: String,
+    pub type_code: String,
+    pub begin_seq: u64,
+    pub end_seq: u64,
 }
 
 struct Ring {
@@ -68,6 +107,7 @@ impl Ring {
                 subscriptions.iter().any(|s| {
                     s.network.eq_ignore_ascii_case(&r.network)
                         && s.station.eq_ignore_ascii_case(&r.station)
+                        && s.matches_channel(&r.payload)
                 })
             })
             .cloned()
@@ -138,6 +178,82 @@ impl DataStore {
     pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.0.notify.notified()
     }
+
+    /// Enumerate unique stations in the ring with min/max sequence numbers.
+    pub(crate) fn station_info(&self) -> Vec<StationInfo> {
+        let ring = self.0.ring.lock().unwrap();
+        // Key: (network, station) → (begin_seq, end_seq)
+        let mut map: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+        for r in &ring.buf {
+            let key = (r.network.clone(), r.station.clone());
+            let seq = r.sequence.value();
+            map.entry(key)
+                .and_modify(|(begin, end)| {
+                    if seq < *begin {
+                        *begin = seq;
+                    }
+                    if seq > *end {
+                        *end = seq;
+                    }
+                })
+                .or_insert((seq, seq));
+        }
+        map.into_iter()
+            .map(|((network, station), (begin_seq, end_seq))| StationInfo {
+                network,
+                station,
+                begin_seq,
+                end_seq,
+            })
+            .collect()
+    }
+
+    /// Enumerate unique streams in the ring with channel detail extracted from payload bytes.
+    pub(crate) fn stream_info(&self) -> Vec<StreamInfo> {
+        type StreamKey = (String, String, String, String);
+        type StreamVal = (String, u64, u64);
+
+        let ring = self.0.ring.lock().unwrap();
+        // Key: (network, station, location, channel) → (type_code, begin_seq, end_seq)
+        let mut map: BTreeMap<StreamKey, StreamVal> = BTreeMap::new();
+        for r in &ring.buf {
+            if r.payload.len() < 20 {
+                continue;
+            }
+            let location = String::from_utf8_lossy(&r.payload[13..15]).to_string();
+            let channel = String::from_utf8_lossy(&r.payload[15..18]).to_string();
+            let type_code = String::from_utf8_lossy(&r.payload[6..7]).to_string();
+            let key = (r.network.clone(), r.station.clone(), location, channel);
+            let seq = r.sequence.value();
+            map.entry(key)
+                .and_modify(|(tc, begin, end)| {
+                    // Keep latest type code
+                    *tc = type_code.clone();
+                    if seq < *begin {
+                        *begin = seq;
+                    }
+                    if seq > *end {
+                        *end = seq;
+                    }
+                })
+                .or_insert((type_code, seq, seq));
+        }
+        map.into_iter()
+            .map(
+                |((network, station, location, channel), (type_code, begin_seq, end_seq))| {
+                    StreamInfo {
+                        network,
+                        station,
+                        channel,
+                        location,
+                        type_code,
+                        begin_seq,
+                        end_seq,
+                    }
+                },
+            )
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +285,7 @@ mod tests {
         let subs = vec![Subscription {
             network: "IU".into(),
             station: "ANMO".into(),
+            select_patterns: vec![],
         }];
 
         let records = store.read_since(0, &subs);
@@ -187,6 +304,7 @@ mod tests {
         let subs = vec![Subscription {
             network: "IU".into(),
             station: "ANMO".into(),
+            select_patterns: vec![],
         }];
 
         let records = store.read_since(2, &subs);
@@ -204,6 +322,7 @@ mod tests {
         let subs = vec![Subscription {
             network: "IU".into(),
             station: "ANMO".into(),
+            select_patterns: vec![],
         }];
 
         let records = store.read_since(0, &subs);

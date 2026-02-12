@@ -1,10 +1,12 @@
 use seedlink_rs_protocol::frame::{PayloadFormat, PayloadSubformat, v3, v4};
-use seedlink_rs_protocol::{Command, ProtocolVersion, Response};
+use seedlink_rs_protocol::{Command, InfoLevel, ProtocolVersion, Response, SequenceNumber};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch;
 use tracing::{debug, info, trace};
 
+use crate::info as info_xml;
+use crate::select::SelectPattern;
 use crate::store::{DataStore, Record, Subscription};
 
 /// Per-client connection state.
@@ -20,6 +22,7 @@ pub(crate) struct HandlerConfig {
     pub software: String,
     pub version: String,
     pub organization: String,
+    pub started: String,
 }
 
 /// Per-client connection handler — runs as a spawned tokio task.
@@ -135,13 +138,33 @@ impl ClientHandler {
                 }
             }
             Command::Station { station, network } => {
-                self.subscriptions.push(Subscription { network, station });
+                self.subscriptions.push(Subscription {
+                    network,
+                    station,
+                    select_patterns: Vec::new(),
+                });
                 self.state = State::Configured;
                 self.send_response(&Response::Ok).await.is_ok()
             }
-            Command::Select { .. } => {
-                // Accept but ignore pattern filtering (deferred to Chunk 3)
-                self.send_response(&Response::Ok).await.is_ok()
+            Command::Select { pattern } => {
+                if let Some(sub) = self.subscriptions.last_mut() {
+                    if let Some(pat) = SelectPattern::parse(&pattern) {
+                        sub.select_patterns.push(pat);
+                        self.send_response(&Response::Ok).await.is_ok()
+                    } else {
+                        let resp = Response::Error {
+                            code: Some(seedlink_rs_protocol::response::ErrorCode::Unsupported),
+                            description: format!("invalid SELECT pattern: {pattern}"),
+                        };
+                        self.send_response(&resp).await.is_ok()
+                    }
+                } else {
+                    let resp = Response::Error {
+                        code: Some(seedlink_rs_protocol::response::ErrorCode::Unsupported),
+                        description: "SELECT requires prior STATION".to_owned(),
+                    };
+                    self.send_response(&resp).await.is_ok()
+                }
             }
             Command::Data { sequence, .. } => {
                 if let Some(seq) = sequence {
@@ -169,6 +192,7 @@ impl ClientHandler {
                 false // streaming ended, close connection
             }
             Command::Bye => false,
+            Command::Info { level } => self.handle_info(level).await,
             _ => {
                 let resp = Response::Error {
                     code: Some(seedlink_rs_protocol::response::ErrorCode::Unsupported),
@@ -241,6 +265,76 @@ impl ClientHandler {
                 }
             }
         }
+    }
+
+    /// Handle INFO command — build XML, send as frame(s), then END.
+    async fn handle_info(&mut self, level: InfoLevel) -> bool {
+        let xml = match level {
+            InfoLevel::Id => {
+                let software = format!("{} {}", self.config.software, self.config.version);
+                info_xml::build_info_id_xml(
+                    &software,
+                    &self.config.organization,
+                    &self.config.started,
+                )
+            }
+            InfoLevel::Stations => {
+                let stations = self.store.station_info();
+                info_xml::build_info_stations_xml(&stations)
+            }
+            InfoLevel::Streams => {
+                let streams = self.store.stream_info();
+                info_xml::build_info_streams_xml(&streams)
+            }
+            _ => {
+                let resp = Response::Error {
+                    code: Some(seedlink_rs_protocol::response::ErrorCode::Unsupported),
+                    description: format!("unsupported INFO level: {level}"),
+                };
+                return self.send_response(&resp).await.is_ok();
+            }
+        };
+
+        let xml_bytes = xml.as_bytes();
+
+        // Send as frame(s) depending on protocol version
+        match self.protocol_version {
+            ProtocolVersion::V3 => {
+                // Split XML into 512-byte chunks, null-pad last one
+                for chunk in xml_bytes.chunks(v3::PAYLOAD_LEN) {
+                    let mut padded = vec![0u8; v3::PAYLOAD_LEN];
+                    padded[..chunk.len()].copy_from_slice(chunk);
+                    let frame = match v3::write(SequenceNumber::new(0), &padded) {
+                        Ok(f) => f,
+                        Err(_) => return false,
+                    };
+                    if self.writer.write_all(&frame).await.is_err() {
+                        return false;
+                    }
+                }
+            }
+            ProtocolVersion::V4 => {
+                let frame = match v4::write(
+                    PayloadFormat::Xml,
+                    PayloadSubformat::Info,
+                    SequenceNumber::new(0),
+                    "",
+                    xml_bytes,
+                ) {
+                    Ok(f) => f,
+                    Err(_) => return false,
+                };
+                if self.writer.write_all(&frame).await.is_err() {
+                    return false;
+                }
+            }
+        }
+
+        // Terminate with END
+        if self.writer.write_all(b"END\r\n").await.is_err() {
+            return false;
+        }
+        self.writer.flush().await.is_ok()
     }
 
     async fn send_response(&mut self, resp: &Response) -> Result<(), std::io::Error> {
