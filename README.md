@@ -2,6 +2,12 @@
 
 Pure Rust SeedLink client and server. Zero `unsafe`, zero C dependency.
 
+[![Crates.io](https://img.shields.io/crates/v/seedlink-rs-protocol.svg)](https://crates.io/crates/seedlink-rs-protocol)
+[![docs.rs](https://docs.rs/seedlink-rs-protocol/badge.svg)](https://docs.rs/seedlink-rs-protocol)
+[![CI](https://github.com/luhtfiimanal/seedlink-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/luhtfiimanal/seedlink-rs/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
+
 Sister project of [miniseed-rs](https://github.com/luhtfiimanal/miniseed-rs).
 
 ## Crates
