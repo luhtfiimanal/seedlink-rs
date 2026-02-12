@@ -33,14 +33,22 @@ seedlink-rs/           # Cargo workspace
   pyscripts/           # TDD oracle (uv + ruff + basedpyright)
 ```
 
+## Crate Names
+
+| Directory | Crate (crates.io) |
+|-----------|-------------------|
+| `seedlink-protocol/` | `seedlink-rs-protocol` |
+| `seedlink-client/` | `seedlink-rs-client` |
+| `seedlink-server/` | `seedlink-rs-server` |
+
 ## Commands
 
 ```bash
-cargo build --workspace                # build all
-cargo test --workspace                 # test all
-cargo test -p seedlink-protocol        # test single crate
-cargo clippy --workspace -- -D warnings  # lint (strict)
-cargo fmt -- --check                   # format check
+cargo build --workspace                    # build all
+cargo test --workspace                     # test all
+cargo test -p seedlink-rs-protocol         # test single crate
+cargo clippy --workspace -- -D warnings    # lint (strict)
+cargo fmt -- --check                       # format check
 
 # pyscripts (TDD vector generation)
 cd pyscripts && uv sync
@@ -48,6 +56,20 @@ cd pyscripts && uv run python -m pyscripts.generate_vectors
 cd pyscripts && uv run ruff check src
 cd pyscripts && uv run basedpyright src
 ```
+
+## Releasing
+
+**Always use the bump script** — never edit versions in Cargo.toml manually:
+
+```bash
+./scripts/bump-version.sh 0.2.0          # bumps ALL crates + workspace dep
+git add -A && git commit -m "chore: bump version to v0.2.0"
+git tag v0.2.0
+git push origin main v0.2.0              # triggers CD → publishes to crates.io
+```
+
+CD publishes in order: `seedlink-rs-protocol` → (wait 30s) → `seedlink-rs-client`.
+Token scope pattern on crates.io: `seedlink-rs-*`.
 
 ## TDD Strategy
 
