@@ -14,3 +14,7 @@ seedlink-rs-protocol.workspace = true
 miniseed-rs.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+seedlink-rs-client = { path = "../seedlink-client" }

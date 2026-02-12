@@ -211,9 +211,11 @@ name = "seedlink-rs-server"
 version = "0.2.0"
 dependencies = [
  "miniseed-rs",
+ "seedlink-rs-client",
  "seedlink-rs-protocol",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
