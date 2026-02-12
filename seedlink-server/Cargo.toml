@@ -1,6 +1,6 @@
 [package]
 name = "seedlink-rs-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "Async SeedLink server for real-time seismic data distribution"
 readme = "../README.md"
 keywords = ["seismic", "seedlink", "server", "streaming", "fdsn"]

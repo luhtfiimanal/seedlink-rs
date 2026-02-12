@@ -1,6 +1,6 @@
 [package]
 name = "seedlink-rs-protocol"
-version = "0.1.0"
+version = "0.2.0"
 description = "SeedLink protocol types, commands, and frame parsing"
 readme = "../README.md"
 keywords = ["seismic", "seedlink", "protocol", "fdsn"]

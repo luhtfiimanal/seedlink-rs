@@ -13,7 +13,7 @@ repository = "https://github.com/luhtfiimanal/seedlink-rs"
 exclude = ["pyscripts/", "CLAUDE.md", "PROMPT.md"]
 
 [workspace.dependencies]
-seedlink-rs-protocol = { version = "0.1.0", path = "seedlink-protocol" }
+seedlink-rs-protocol = { version = "0.2.0", path = "seedlink-protocol" }
 miniseed-rs = "0.2"
 thiserror = "2"
 tracing = "0.1"
