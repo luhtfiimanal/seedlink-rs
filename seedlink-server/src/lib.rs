@@ -1,22 +1,34 @@
 //! Async SeedLink server for real-time seismic data distribution.
 //!
 //! Accept client connections and distribute miniSEED records
-//! from configured data sources via an in-memory ring buffer.
+//! from configured data sources via a ring buffer that can optionally be
+//! journaled to disk, so clients resume with `DATA <seq>` across restarts.
 //!
 //! # Example
 //!
 //! ```no_run
 //! # async fn example() -> seedlink_rs_server::Result<()> {
-//! use seedlink_rs_server::SeedLinkServer;
+//! use seedlink_rs_server::{SeedLinkServer, ServerConfig, SyncPolicy};
 //!
-//! let server = SeedLinkServer::bind("0.0.0.0:18000").await?;
+//! let config = ServerConfig {
+//!     // Journal the ring buffer so DATA <seq> resume survives restarts.
+//!     persist_dir: Some("/var/lib/seedlink/journal".into()),
+//!     ..ServerConfig::default()
+//! };
+//! let server = SeedLinkServer::bind_with_config("0.0.0.0:18000", config).await?;
 //! let store = server.store().clone();
+//!
+//! // In-process connections (e.g. a WebSocket bridge) — no TCP hop:
+//! let connector = server.local_connector();
 //!
 //! tokio::spawn(server.run());
 //!
 //! // Push data from any source
 //! let payload = vec![0u8; 512];
-//! store.push("IU", "ANMO", &payload);
+//! store.push("IU", "ANMO", &payload)?;
+//!
+//! // Speak the SeedLink protocol over an in-process duplex stream
+//! let _stream = connector.connect();
 //! # Ok(())
 //! # }
 //! ```
@@ -25,18 +37,23 @@ pub(crate) mod connections;
 pub mod error;
 pub(crate) mod handler;
 pub(crate) mod info;
+pub(crate) mod journal;
 pub(crate) mod select;
 pub mod store;
 pub(crate) mod time;
 
 pub use error::{Result, ServerError};
-pub use store::DataStore;
+pub use journal::SyncPolicy;
+pub use store::{DataStore, MAX_PAYLOAD_LEN};
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
-use connections::ConnectionRegistry;
+use connections::{ConnectionRegistry, Peer};
 use handler::{ClientHandler, HandlerConfig};
+use tokio::io::DuplexStream;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -110,6 +127,13 @@ pub struct ServerConfig {
     pub organization: String,
     /// Ring buffer capacity (number of records). Default: `10_000`.
     pub ring_capacity: usize,
+    /// Directory for the on-disk ring buffer journal. When set, the ring is
+    /// recovered on startup and `DATA <seq>` resume works across restarts.
+    /// Default: `None` (in-memory only).
+    pub persist_dir: Option<PathBuf>,
+    /// fsync policy for the journal (ignored without `persist_dir`).
+    /// Default: [`SyncPolicy::EveryRecord`].
+    pub sync_policy: SyncPolicy,
 }
 
 impl Default for ServerConfig {
@@ -119,6 +143,8 @@ impl Default for ServerConfig {
             version: "v3.1".to_owned(),
             organization: "seedlink-rs".to_owned(),
             ring_capacity: 10_000,
+            persist_dir: None,
+            sync_policy: SyncPolicy::EveryRecord,
         }
     }
 }
@@ -159,9 +185,15 @@ impl SeedLinkServer {
     }
 
     /// Bind to the given address with custom configuration.
+    ///
+    /// With `persist_dir` set, journaled records are recovered before the
+    /// listener starts accepting; a journal that cannot be opened is an error.
     pub async fn bind_with_config(addr: &str, config: ServerConfig) -> Result<Self> {
         let listener = TcpListener::bind(addr).await.map_err(ServerError::Bind)?;
-        let store = DataStore::new(config.ring_capacity);
+        let store = match &config.persist_dir {
+            Some(dir) => DataStore::with_journal(config.ring_capacity, dir, config.sync_policy)?,
+            None => DataStore::new(config.ring_capacity),
+        };
         let started = format_timestamp(SystemTime::now());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let connections = ConnectionRegistry::new();
@@ -194,6 +226,25 @@ impl SeedLinkServer {
         }
     }
 
+    /// Returns a connector for opening in-process SeedLink connections.
+    ///
+    /// Each [`LocalConnector::connect`] call yields one end of a duplex
+    /// stream whose other end is served by a regular client handler — the
+    /// same protocol as TCP, without the localhost socket hop. Useful for
+    /// embedding (e.g. bridging WebSocket clients).
+    ///
+    /// The connector stays valid after [`run()`](Self::run) consumes the
+    /// server, and honors graceful shutdown.
+    pub fn local_connector(&self) -> LocalConnector {
+        LocalConnector {
+            store: self.store.clone(),
+            config: Arc::new(self.config.clone()),
+            started: self.started.clone(),
+            shutdown_rx: self.shutdown_rx.clone(),
+            connections: self.connections.clone(),
+        }
+    }
+
     /// Run the accept loop. Spawns a task per client connection.
     ///
     /// Returns when shutdown is signalled or the listener fails.
@@ -218,7 +269,7 @@ impl SeedLinkServer {
             info!(%addr, "accepted connection");
             stream.set_nodelay(true).ok();
 
-            let conn_id = self.connections.register(addr);
+            let conn_id = self.connections.register(Peer::Tcp(addr));
             let (read_half, write_half) = stream.into_split();
             let store = self.store.clone();
             let handler_config = HandlerConfig {
@@ -243,6 +294,56 @@ impl SeedLinkServer {
                 handler.run().await;
             });
         }
+    }
+}
+
+/// Opens in-process SeedLink connections served by the same handler as TCP
+/// clients. Obtained via [`SeedLinkServer::local_connector`]. Clone is cheap.
+#[derive(Clone)]
+pub struct LocalConnector {
+    store: DataStore,
+    config: Arc<ServerConfig>,
+    started: String,
+    shutdown_rx: watch::Receiver<bool>,
+    connections: ConnectionRegistry,
+}
+
+impl LocalConnector {
+    /// Buffer size of the in-process duplex pipe.
+    const DUPLEX_BUF: usize = 64 * 1024;
+
+    /// Open a new in-process connection. The returned stream speaks the
+    /// SeedLink protocol exactly like a TCP socket to the server; drop it
+    /// to disconnect.
+    pub fn connect(&self) -> DuplexStream {
+        let (client_io, server_io) = tokio::io::duplex(Self::DUPLEX_BUF);
+        let (read_half, write_half) = tokio::io::split(server_io);
+
+        let conn_id = self.connections.register(Peer::Local);
+        let handler_config = HandlerConfig {
+            software: self.config.software.clone(),
+            version: self.config.version.clone(),
+            organization: self.config.organization.clone(),
+            started: self.started.clone(),
+        };
+        let store = self.store.clone();
+        let shutdown_rx = self.shutdown_rx.clone();
+        let connections = self.connections.clone();
+
+        tokio::spawn(async move {
+            let handler = ClientHandler::new(
+                read_half,
+                write_half,
+                store,
+                handler_config,
+                shutdown_rx,
+                conn_id,
+                connections,
+            );
+            handler.run().await;
+        });
+
+        client_io
     }
 }
 
@@ -335,8 +436,8 @@ mod tests {
 
         // Push 2 records before client connects
         let payload = make_payload("ANMO", "IU");
-        store.push("IU", "ANMO", &payload);
-        store.push("IU", "ANMO", &payload);
+        store.push("IU", "ANMO", &payload).unwrap();
+        store.push("IU", "ANMO", &payload).unwrap();
 
         let mut client = SeedLinkClient::connect(&addr).await.unwrap();
         client.station("ANMO", "IU").await.unwrap();
@@ -364,7 +465,7 @@ mod tests {
         // Push after streaming has started
         let payload = make_payload("ANMO", "IU");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        store.push("IU", "ANMO", &payload);
+        store.push("IU", "ANMO", &payload).unwrap();
 
         let f = client.next_frame().await.unwrap().unwrap();
         assert_eq!(f.sequence(), SequenceNumber::new(1));
@@ -378,7 +479,7 @@ mod tests {
 
         let payload = make_payload("ANMO", "IU");
         for _ in 0..5 {
-            store.push("IU", "ANMO", &payload);
+            store.push("IU", "ANMO", &payload).unwrap();
         }
 
         let mut client = SeedLinkClient::connect(&addr).await.unwrap();
@@ -400,8 +501,10 @@ mod tests {
     async fn multi_station_subscription() {
         let (store, addr) = start_server().await;
 
-        store.push("IU", "ANMO", &make_payload("ANMO", "IU"));
-        store.push("GE", "WLF", &make_payload("WLF", "GE"));
+        store
+            .push("IU", "ANMO", &make_payload("ANMO", "IU"))
+            .unwrap();
+        store.push("GE", "WLF", &make_payload("WLF", "GE")).unwrap();
 
         let mut client = SeedLinkClient::connect(&addr).await.unwrap();
         client.station("ANMO", "IU").await.unwrap();
@@ -423,9 +526,13 @@ mod tests {
     async fn station_filtering() {
         let (store, addr) = start_server().await;
 
-        store.push("IU", "ANMO", &make_payload("ANMO", "IU"));
-        store.push("GE", "WLF", &make_payload("WLF", "GE"));
-        store.push("IU", "ANMO", &make_payload("ANMO", "IU"));
+        store
+            .push("IU", "ANMO", &make_payload("ANMO", "IU"))
+            .unwrap();
+        store.push("GE", "WLF", &make_payload("WLF", "GE")).unwrap();
+        store
+            .push("IU", "ANMO", &make_payload("ANMO", "IU"))
+            .unwrap();
 
         // Only subscribe to IU.ANMO
         let mut client = SeedLinkClient::connect(&addr).await.unwrap();
@@ -471,7 +578,7 @@ mod tests {
         client2.end_stream().await.unwrap();
 
         let payload = make_payload("ANMO", "IU");
-        store.push("IU", "ANMO", &payload);
+        store.push("IU", "ANMO", &payload).unwrap();
 
         let f1 = client1.next_frame().await.unwrap().unwrap();
         let f2 = client2.next_frame().await.unwrap().unwrap();
@@ -491,7 +598,7 @@ mod tests {
 
         let payload = make_payload("ANMO", "IU");
         for _ in 0..5 {
-            store.push("IU", "ANMO", &payload);
+            store.push("IU", "ANMO", &payload).unwrap();
         }
 
         let mut client = SeedLinkClient::connect(&addr).await.unwrap();
@@ -536,8 +643,8 @@ mod tests {
         let (store, addr) = start_server().await;
 
         let payload = make_payload("ANMO", "IU");
-        store.push("IU", "ANMO", &payload);
-        store.push("IU", "ANMO", &payload);
+        store.push("IU", "ANMO", &payload).unwrap();
+        store.push("IU", "ANMO", &payload).unwrap();
 
         // Default client config: prefer_v4 = true
         let mut client = SeedLinkClient::connect(&addr).await.unwrap();
@@ -574,7 +681,7 @@ mod tests {
         let (store, addr) = start_server().await;
 
         let payload = make_payload("ANMO", "IU");
-        store.push("IU", "ANMO", &payload);
+        store.push("IU", "ANMO", &payload).unwrap();
 
         let config = ClientConfig {
             prefer_v4: false,
@@ -604,8 +711,8 @@ mod tests {
         let (store, addr) = start_server().await;
 
         let payload = make_payload("ANMO", "IU");
-        store.push("IU", "ANMO", &payload);
-        store.push("IU", "ANMO", &payload);
+        store.push("IU", "ANMO", &payload).unwrap();
+        store.push("IU", "ANMO", &payload).unwrap();
 
         let config = ClientConfig {
             prefer_v4: false,
@@ -639,7 +746,7 @@ mod tests {
 
         let payload = make_payload("ANMO", "IU");
         for _ in 0..5 {
-            store.push("IU", "ANMO", &payload);
+            store.push("IU", "ANMO", &payload).unwrap();
         }
 
         let config = ClientConfig {
@@ -680,7 +787,7 @@ mod tests {
 
         // Push one frame so we know connection is alive
         let payload = make_payload("ANMO", "IU");
-        store.push("IU", "ANMO", &payload);
+        store.push("IU", "ANMO", &payload).unwrap();
         let f = client.next_frame().await.unwrap().unwrap();
         assert_eq!(f.sequence(), SequenceNumber::new(1));
 
@@ -750,8 +857,10 @@ mod tests {
     async fn info_stations_returns_pushed_stations() {
         let (store, addr) = start_server().await;
 
-        store.push("IU", "ANMO", &make_payload("ANMO", "IU"));
-        store.push("GE", "WLF", &make_payload("WLF", "GE"));
+        store
+            .push("IU", "ANMO", &make_payload("ANMO", "IU"))
+            .unwrap();
+        store.push("GE", "WLF", &make_payload("WLF", "GE")).unwrap();
 
         let config = ClientConfig {
             prefer_v4: false,
@@ -794,7 +903,7 @@ mod tests {
         payload[15] = b'B';
         payload[16] = b'H';
         payload[17] = b'Z';
-        store.push("IU", "ANMO", &payload);
+        store.push("IU", "ANMO", &payload).unwrap();
 
         let config = ClientConfig {
             prefer_v4: false,
@@ -856,17 +965,17 @@ mod tests {
         payload_bhz[15] = b'B';
         payload_bhz[16] = b'H';
         payload_bhz[17] = b'Z';
-        store.push("IU", "ANMO", &payload_bhz);
+        store.push("IU", "ANMO", &payload_bhz).unwrap();
 
         // Push BHN record
         let mut payload_bhn = make_payload("ANMO", "IU");
         payload_bhn[15] = b'B';
         payload_bhn[16] = b'H';
         payload_bhn[17] = b'N';
-        store.push("IU", "ANMO", &payload_bhn);
+        store.push("IU", "ANMO", &payload_bhn).unwrap();
 
         // Push another BHZ record
-        store.push("IU", "ANMO", &payload_bhz);
+        store.push("IU", "ANMO", &payload_bhz).unwrap();
 
         let config = ClientConfig {
             prefer_v4: false,
@@ -902,19 +1011,19 @@ mod tests {
         payload_bhz[15] = b'B';
         payload_bhz[16] = b'H';
         payload_bhz[17] = b'Z';
-        store.push("IU", "ANMO", &payload_bhz);
+        store.push("IU", "ANMO", &payload_bhz).unwrap();
 
         let mut payload_bhn = make_payload("ANMO", "IU");
         payload_bhn[15] = b'B';
         payload_bhn[16] = b'H';
         payload_bhn[17] = b'N';
-        store.push("IU", "ANMO", &payload_bhn);
+        store.push("IU", "ANMO", &payload_bhn).unwrap();
 
         let mut payload_lhz = make_payload("ANMO", "IU");
         payload_lhz[15] = b'L';
         payload_lhz[16] = b'H';
         payload_lhz[17] = b'Z';
-        store.push("IU", "ANMO", &payload_lhz);
+        store.push("IU", "ANMO", &payload_lhz).unwrap();
 
         let config = ClientConfig {
             prefer_v4: false,
@@ -950,13 +1059,13 @@ mod tests {
         payload_bhz[15] = b'B';
         payload_bhz[16] = b'H';
         payload_bhz[17] = b'Z';
-        store.push("IU", "ANMO", &payload_bhz);
+        store.push("IU", "ANMO", &payload_bhz).unwrap();
 
         let mut payload_bhn = make_payload("ANMO", "IU");
         payload_bhn[15] = b'B';
         payload_bhn[16] = b'H';
         payload_bhn[17] = b'N';
-        store.push("IU", "ANMO", &payload_bhn);
+        store.push("IU", "ANMO", &payload_bhn).unwrap();
 
         let config = ClientConfig {
             prefer_v4: false,
@@ -1008,12 +1117,12 @@ mod tests {
         // Record 1: Jan 15, 2024 (DOY 15) — within range
         let mut payload_jan = make_payload("ANMO", "IU");
         set_btime(&mut payload_jan, 2024, 15, 12, 0, 0);
-        store.push("IU", "ANMO", &payload_jan);
+        store.push("IU", "ANMO", &payload_jan).unwrap();
 
         // Record 2: Feb 15, 2024 (DOY 46) — out of range
         let mut payload_feb = make_payload("ANMO", "IU");
         set_btime(&mut payload_feb, 2024, 46, 12, 0, 0);
-        store.push("IU", "ANMO", &payload_feb);
+        store.push("IU", "ANMO", &payload_feb).unwrap();
 
         let config = ClientConfig {
             prefer_v4: false,
@@ -1049,17 +1158,17 @@ mod tests {
         // Record 1: Dec 2023 (DOY 365) — before start
         let mut payload_dec = make_payload("ANMO", "IU");
         set_btime(&mut payload_dec, 2023, 365, 12, 0, 0);
-        store.push("IU", "ANMO", &payload_dec);
+        store.push("IU", "ANMO", &payload_dec).unwrap();
 
         // Record 2: Jan 15, 2024 (DOY 15) — after start
         let mut payload_jan = make_payload("ANMO", "IU");
         set_btime(&mut payload_jan, 2024, 15, 12, 0, 0);
-        store.push("IU", "ANMO", &payload_jan);
+        store.push("IU", "ANMO", &payload_jan).unwrap();
 
         // Record 3: Jun 15, 2024 (DOY 167) — after start
         let mut payload_jun = make_payload("ANMO", "IU");
         set_btime(&mut payload_jun, 2024, 167, 12, 0, 0);
-        store.push("IU", "ANMO", &payload_jun);
+        store.push("IU", "ANMO", &payload_jun).unwrap();
 
         let config = ClientConfig {
             prefer_v4: false,
@@ -1174,8 +1283,10 @@ mod tests {
     async fn batch_mode_multiple_stations() {
         let (store, addr) = start_server().await;
 
-        store.push("IU", "ANMO", &make_payload("ANMO", "IU"));
-        store.push("GE", "WLF", &make_payload("WLF", "GE"));
+        store
+            .push("IU", "ANMO", &make_payload("ANMO", "IU"))
+            .unwrap();
+        store.push("GE", "WLF", &make_payload("WLF", "GE")).unwrap();
 
         let stream = TcpStream::connect(&addr).await.unwrap();
         let (read_half, mut write_half) = stream.into_split();
@@ -1321,5 +1432,197 @@ mod tests {
             count_after < count_before,
             "expected fewer connections after BYE: before={count_before}, after={count_after}"
         );
+    }
+
+    // ---- Test 29: resume_across_server_restart ----
+
+    #[tokio::test]
+    async fn resume_across_server_restart() {
+        let tmp = crate::journal::testutil::TempDir::new("server-restart");
+        let payload = make_payload("ANMO", "IU");
+
+        // First server lifetime: push 5 records, then shut down.
+        {
+            let config = ServerConfig {
+                persist_dir: Some(tmp.0.clone()),
+                ..ServerConfig::default()
+            };
+            let server = SeedLinkServer::bind_with_config("127.0.0.1:0", config)
+                .await
+                .unwrap();
+            let store = server.store().clone();
+            let handle = server.shutdown_handle();
+            tokio::spawn(server.run());
+            tokio::task::yield_now().await;
+
+            for _ in 0..5 {
+                store.push("IU", "ANMO", &payload).unwrap();
+            }
+            handle.shutdown();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Second server lifetime: same journal dir, fresh port.
+        let config = ServerConfig {
+            persist_dir: Some(tmp.0.clone()),
+            ..ServerConfig::default()
+        };
+        let server = SeedLinkServer::bind_with_config("127.0.0.1:0", config)
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let store = server.store().clone();
+        tokio::spawn(server.run());
+        tokio::task::yield_now().await;
+
+        // A client that saw seq 3 before the restart resumes and must get 4, 5.
+        let mut client = SeedLinkClient::connect(&addr).await.unwrap();
+        client.station("ANMO", "IU").await.unwrap();
+        client.data_from(SequenceNumber::new(3)).await.unwrap();
+        client.end_stream().await.unwrap();
+
+        let f1 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f1.sequence(), SequenceNumber::new(4));
+        let f2 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f2.sequence(), SequenceNumber::new(5));
+
+        // Live pushes continue the pre-restart numbering — no reuse.
+        store.push("IU", "ANMO", &payload).unwrap();
+        let f3 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f3.sequence(), SequenceNumber::new(6));
+    }
+
+    // ---- Test 30: local_connector_streams_without_tcp ----
+
+    #[tokio::test]
+    async fn local_connector_streams_without_tcp() {
+        let server = SeedLinkServer::bind("127.0.0.1:0").await.unwrap();
+        let store = server.store().clone();
+        let connector = server.local_connector();
+        tokio::spawn(server.run());
+        tokio::task::yield_now().await;
+
+        store
+            .push("IU", "ANMO", &make_payload("ANMO", "IU"))
+            .unwrap();
+        store
+            .push("IU", "ANMO", &make_payload("ANMO", "IU"))
+            .unwrap();
+
+        // Speak raw SeedLink over the in-process duplex stream.
+        let stream = connector.connect();
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+
+        write_half.write_all(b"HELLO\r\n").await.unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.contains("SeedLink"), "HELLO reply: {line:?}");
+        line.clear();
+        reader.read_line(&mut line).await.unwrap(); // organization line
+
+        write_half.write_all(b"STATION ANMO IU\r\n").await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("OK"), "STATION reply: {line:?}");
+
+        write_half.write_all(b"DATA\r\n").await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("OK"), "DATA reply: {line:?}");
+
+        write_half.write_all(b"END\r\n").await.unwrap();
+
+        let mut frame = vec![0u8; v3::FRAME_LEN];
+        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut frame)
+            .await
+            .unwrap();
+        assert_eq!(&frame[0..2], b"SL");
+        assert_eq!(&frame[2..8], b"000001");
+
+        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut frame)
+            .await
+            .unwrap();
+        assert_eq!(&frame[2..8], b"000002");
+
+        // Live push must reach the in-process client too.
+        store
+            .push("IU", "ANMO", &make_payload("ANMO", "IU"))
+            .unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut frame)
+            .await
+            .unwrap();
+        assert_eq!(&frame[2..8], b"000003");
+    }
+
+    // ---- Test 31: v3_skips_non_512_records ----
+
+    #[tokio::test]
+    async fn v3_skips_non_512_records() {
+        let (store, addr) = start_server().await;
+
+        store
+            .push("IU", "ANMO", &make_payload("ANMO", "IU"))
+            .unwrap();
+        store.push("IU", "ANMO", &[0u8; 256]).unwrap(); // not representable in v3
+        store
+            .push("IU", "ANMO", &make_payload("ANMO", "IU"))
+            .unwrap();
+
+        let config = ClientConfig {
+            prefer_v4: false,
+            ..ClientConfig::default()
+        };
+        let mut client = SeedLinkClient::connect_with_config(&addr, config)
+            .await
+            .unwrap();
+        client.station("ANMO", "IU").await.unwrap();
+        client.data().await.unwrap();
+        client.fetch().await.unwrap();
+
+        // seq 2 is silently skipped on a v3 connection
+        let f1 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f1.sequence(), SequenceNumber::new(1));
+        let f2 = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f2.sequence(), SequenceNumber::new(3));
+        let f3 = client.next_frame().await.unwrap();
+        assert!(f3.is_none(), "expected EOF after FETCH");
+    }
+
+    // ---- Test 32: v4_carries_variable_length_records ----
+
+    #[tokio::test]
+    async fn v4_carries_variable_length_records() {
+        let (store, addr) = start_server().await;
+
+        // A miniSEED v3-style record: "MS" magic + format version 3, 300 bytes.
+        let mut ms3 = vec![0u8; 300];
+        ms3[0] = b'M';
+        ms3[1] = b'S';
+        ms3[2] = 3;
+        // Station/network fields for the subscription filter don't exist in
+        // this fake record, but network/station routing uses push() args.
+        store.push("IU", "ANMO", &ms3).unwrap();
+
+        let mut client = SeedLinkClient::connect(&addr).await.unwrap();
+        assert_eq!(client.version(), seedlink_rs_protocol::ProtocolVersion::V4);
+        client.station("ANMO", "IU").await.unwrap();
+        client.data().await.unwrap();
+        client.end_stream().await.unwrap();
+
+        let f = client.next_frame().await.unwrap().unwrap();
+        assert_eq!(f.sequence(), SequenceNumber::new(1));
+        match &f {
+            OwnedFrame::V4 {
+                format, payload, ..
+            } => {
+                assert_eq!(
+                    *format,
+                    seedlink_rs_protocol::frame::PayloadFormat::MiniSeed3
+                );
+                assert_eq!(payload.len(), 300);
+            }
+            _ => panic!("expected V4 frame"),
+        }
     }
 }

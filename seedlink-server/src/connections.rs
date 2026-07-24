@@ -11,10 +11,35 @@ use std::time::SystemTime;
 
 use seedlink_rs_protocol::ProtocolVersion;
 
+/// Where a connection came from: a TCP peer or an in-process stream.
+#[derive(Clone, Debug)]
+pub(crate) enum Peer {
+    Tcp(SocketAddr),
+    Local,
+}
+
+impl Peer {
+    /// Host shown in INFO CONNECTIONS.
+    pub fn host(&self) -> String {
+        match self {
+            Peer::Tcp(addr) => addr.ip().to_string(),
+            Peer::Local => "local".to_owned(),
+        }
+    }
+
+    /// Port shown in INFO CONNECTIONS (0 for in-process connections).
+    pub fn port(&self) -> u16 {
+        match self {
+            Peer::Tcp(addr) => addr.port(),
+            Peer::Local => 0,
+        }
+    }
+}
+
 /// Per-connection metadata.
 #[derive(Clone, Debug)]
 pub(crate) struct ConnectionInfo {
-    pub addr: SocketAddr,
+    pub peer: Peer,
     pub connected_at: SystemTime,
     pub protocol_version: ProtocolVersion,
     pub user_agent: Option<String>,
@@ -40,10 +65,10 @@ impl ConnectionRegistry {
     }
 
     /// Register a new connection. Returns a unique connection ID.
-    pub fn register(&self, addr: SocketAddr) -> u64 {
+    pub fn register(&self, peer: Peer) -> u64 {
         let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
         let info = ConnectionInfo {
-            addr,
+            peer,
             connected_at: SystemTime::now(),
             protocol_version: ProtocolVersion::V3,
             user_agent: None,
@@ -91,8 +116,8 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    fn addr(port: u16) -> Peer {
+        Peer::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
     }
 
     #[test]

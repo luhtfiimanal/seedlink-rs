@@ -6,8 +6,12 @@ pub enum ServerError {
     Protocol(#[from] seedlink_rs_protocol::SeedlinkError),
     #[error("bind failed: {0}")]
     Bind(std::io::Error),
-    #[error("invalid payload length: expected 512, got {0}")]
-    InvalidPayloadLength(usize),
+    #[error("payload is empty")]
+    EmptyPayload,
+    #[error("payload too large: {len} bytes (max {max})")]
+    PayloadTooLarge { len: usize, max: usize },
+    #[error("journal error: {0}")]
+    Journal(std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, ServerError>;

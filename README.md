@@ -52,9 +52,28 @@ async fn main() -> seedlink_rs_server::Result<()> {
 
     // Push miniSEED records from any source
     let payload = vec![0u8; 512];
-    store.push("IU", "ANMO", &payload);
+    store.push("IU", "ANMO", &payload)?;
     Ok(())
 }
+```
+
+Durable ring buffer (clients resume with `DATA <seq>` across server restarts)
+and in-process connections:
+
+```rust
+use seedlink_rs_server::{SeedLinkServer, ServerConfig, SyncPolicy};
+
+let config = ServerConfig {
+    persist_dir: Some("/var/lib/seedlink/journal".into()),
+    sync_policy: SyncPolicy::EveryRecord,
+    ..ServerConfig::default()
+};
+let server = SeedLinkServer::bind_with_config("0.0.0.0:18000", config).await?;
+
+// Serve a connection without a TCP hop (e.g. behind a WebSocket bridge)
+let connector = server.local_connector();
+tokio::spawn(server.run());
+let stream = connector.connect(); // speaks SeedLink over a duplex pipe
 ```
 
 ## Features
@@ -86,7 +105,16 @@ async fn main() -> seedlink_rs_server::Result<()> {
 ### Server (`seedlink-rs-server`)
 
 - Async TCP server — multiple concurrent clients
-- In-memory ring buffer with configurable capacity
+- Ring buffer with configurable capacity — in-memory, or journaled to disk
+  (CRC-checked segmented log) so `DATA <seq>` resume survives restarts
+- Configurable fsync policy (`EveryRecord` / `EveryN` / `Os`) with
+  crash-safe sequence continuation (no sequence aliasing after power loss)
+- Sequence-wrap-safe resume (24-bit v3 sequence space handled modularly)
+- Variable-length payloads (miniSEED v3-ready): v4 clients receive any
+  record length, v3 clients transparently skip non-512-byte records
+- Non-panicking `push()` — payload validation returns typed errors
+- In-process connections via `local_connector()` — embed the server and
+  bridge WebSocket/other transports without a localhost TCP hop
 - Dual protocol: v3 and v4 frame streaming (auto-adapts per client)
 - Multi-station subscription per client
 - SELECT pattern filtering with `?` wildcards (`BHZ`, `BH?`, `00BHZ.D`)
@@ -104,7 +132,7 @@ Tested against real SeedLink servers:
 - IRIS: `rtserve.iris.washington.edu:18000`
 - GEOFON: `geofon.gfz-potsdam.de:18000`
 
-219 tests passing across all three crates.
+235 tests passing across all three crates.
 
 ## Benchmarks
 

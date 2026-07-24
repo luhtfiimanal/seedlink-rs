@@ -90,8 +90,8 @@ pub(crate) fn build_info_connections_xml(connections: &[ConnectionInfo]) -> Stri
     let mut xml = String::from("<?xml version=\"1.0\"?>\n<seedlink>\n");
     for c in connections {
         let ctime = format_timestamp(c.connected_at);
-        let host = xml_escape(&c.addr.to_string());
-        let port = c.addr.port();
+        let host = xml_escape(&c.peer.host());
+        let port = c.peer.port();
         let ua = c.user_agent.as_deref().map(xml_escape).unwrap_or_default();
         let proto = match c.protocol_version {
             seedlink_rs_protocol::ProtocolVersion::V3 => "3.1",
