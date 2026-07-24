@@ -1,7 +1,6 @@
 use seedlink_rs_protocol::frame::{PayloadFormat, PayloadSubformat, v3, v4};
 use seedlink_rs_protocol::{Command, InfoLevel, ProtocolVersion, Response, SequenceNumber};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::watch;
 use tracing::{debug, info, trace};
 
@@ -28,9 +27,12 @@ pub(crate) struct HandlerConfig {
 }
 
 /// Per-client connection handler — runs as a spawned tokio task.
-pub(crate) struct ClientHandler {
-    reader: BufReader<OwnedReadHalf>,
-    writer: BufWriter<OwnedWriteHalf>,
+///
+/// Generic over the transport so the same handler serves TCP sockets and
+/// in-process duplex streams (see `LocalConnector`).
+pub(crate) struct ClientHandler<R, W> {
+    reader: BufReader<R>,
+    writer: BufWriter<W>,
     store: DataStore,
     config: HandlerConfig,
     state: State,
@@ -42,10 +44,14 @@ pub(crate) struct ClientHandler {
     connections: ConnectionRegistry,
 }
 
-impl ClientHandler {
+impl<R, W> ClientHandler<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     pub fn new(
-        read_half: OwnedReadHalf,
-        write_half: OwnedWriteHalf,
+        read_half: R,
+        write_half: W,
         store: DataStore,
         config: HandlerConfig,
         shutdown_rx: watch::Receiver<bool>,
@@ -183,15 +189,11 @@ impl ClientHandler {
                 }
             }
             Command::Data { sequence, .. } => {
-                if let Some(seq) = sequence {
-                    self.resume_seq = Some(seq.value());
-                }
+                self.set_resume_seq(sequence);
                 self.send_response(&Response::Ok).await.is_ok()
             }
             Command::Fetch { sequence } => {
-                if let Some(seq) = sequence {
-                    self.resume_seq = Some(seq.value());
-                }
+                self.set_resume_seq(sequence);
                 // No response for FETCH — binary streaming starts immediately
                 self.state = State::Streaming;
                 self.connections.update(self.conn_id, |info| {
@@ -253,19 +255,54 @@ impl ClientHandler {
         }
     }
 
+    /// Record a resume cursor, ignoring sentinel values: `ALL_DATA`/`UNSET`
+    /// mean "start from everything available", i.e. no cursor.
+    fn set_resume_seq(&mut self, sequence: Option<SequenceNumber>) {
+        match sequence {
+            Some(seq) if !seq.is_special() => self.resume_seq = Some(seq.value()),
+            Some(_) => self.resume_seq = None,
+            None => {}
+        }
+    }
+
     /// Build a frame for the current protocol version.
-    fn build_frame(&self, record: &Record) -> Result<Vec<u8>, seedlink_rs_protocol::SeedlinkError> {
+    ///
+    /// Returns `Ok(None)` when the record cannot be carried on this
+    /// connection (v3 frames are fixed at 512-byte payloads).
+    fn build_frame(
+        &self,
+        record: &Record,
+    ) -> Result<Option<Vec<u8>>, seedlink_rs_protocol::SeedlinkError> {
         match self.protocol_version {
-            ProtocolVersion::V3 => v3::write(record.sequence, &record.payload),
+            ProtocolVersion::V3 => {
+                if record.payload.len() != v3::PAYLOAD_LEN {
+                    debug!(
+                        sequence = record.sequence.value(),
+                        len = record.payload.len(),
+                        "skipping non-512-byte record on v3 connection"
+                    );
+                    return Ok(None);
+                }
+                v3::write(record.sequence, &record.payload).map(Some)
+            }
             ProtocolVersion::V4 => {
                 let station_id = format!("{}_{}", record.network, record.station);
+                // miniSEED v3 records start with "MS" + format version 3.
+                let format = if record.payload.get(0..2) == Some(b"MS")
+                    && record.payload.get(2) == Some(&3)
+                {
+                    PayloadFormat::MiniSeed3
+                } else {
+                    PayloadFormat::MiniSeed2
+                };
                 v4::write(
-                    PayloadFormat::MiniSeed2,
+                    format,
                     PayloadSubformat::Data,
                     record.sequence,
                     &station_id,
                     &record.payload,
                 )
+                .map(Some)
             }
         }
     }
@@ -284,14 +321,16 @@ impl ClientHandler {
             let records = self.store.read_since(cursor, &self.subscriptions);
             if !records.is_empty() {
                 for r in &records {
-                    let frame = match self.build_frame(r) {
-                        Ok(f) => f,
+                    match self.build_frame(r) {
+                        Ok(Some(frame)) => {
+                            if self.writer.write_all(&frame).await.is_err() {
+                                return;
+                            }
+                            trace!(sequence = %r.sequence, "frame sent");
+                        }
+                        Ok(None) => {} // not representable on this connection — skip
                         Err(_) => return,
-                    };
-                    if self.writer.write_all(&frame).await.is_err() {
-                        return;
                     }
-                    trace!(sequence = %r.sequence, "frame sent");
                     cursor = r.sequence.value();
                 }
                 if self.writer.flush().await.is_err() {

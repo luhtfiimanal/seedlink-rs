@@ -162,7 +162,7 @@ async fn main() {
     let push_start = Instant::now();
     let payload = make_payload("ANMO", "IU");
     for _ in 0..num_records {
-        store.push("IU", "ANMO", &payload);
+        store.push("IU", "ANMO", &payload).unwrap();
     }
     let push_elapsed = push_start.elapsed();
     println!(
